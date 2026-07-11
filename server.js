@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 
 const app = express();
-app.use(cors({ origin: 'https://ahmadswork.com', credentials: true }));
+app.use(cors({ origin: ['https://ahmadswork.com', 'https://www.ahmadswork.com'], credentials: true }));
 app.use(express.json());
 
 // Try MySQL, fall back to memory if unavailable
@@ -87,10 +87,4 @@ app.get('/api/rest/conversations/:userId', async (req, res) => { try { const [ro
 
 app.get('/api/rest/conversations/:userId/:id', async (req, res) => { try { const [conv] = await query('SELECT * FROM conversations WHERE id = ? AND userId = ?', [req.params.id, req.params.userId]); if (!conv[0]) return res.status(404).json({ error: 'Not found' }); const [msgs] = await query('SELECT * FROM messages WHERE conversationId = ? ORDER BY createdAt', [req.params.id]); res.json({ ...conv[0], messages: msgs }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
-app.post('/api/rest/conversations/:userId', async (req, res) => { try { const [result] = await query('INSERT INTO conversations (userId, title, createdAt, updatedAt) VALUES (?, ?, NOW(), NOW())', [req.params.userId, req.body.title]); res.json({ id: result.insertId, userId: Number(req.params.userId), title: req.body.title, createdAt: new Date(), updatedAt: new Date() }); } catch (e) { res.status(500).json({ error: e.message }); } });
-
-app.delete('/api/rest/conversations/:userId/:id', async (req, res) => { try { await query('DELETE FROM messages WHERE conversationId = ?', [req.params.id]); await query('DELETE FROM conversations WHERE id = ?', [req.params.id]); res.json({ success: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
-
-app.post('/api/rest/messages/:userId', async (req, res) => { try { const { conversationId, content } = req.body; const [conv] = await query('SELECT * FROM conversations WHERE id = ? AND userId = ?', [conversationId, req.params.userId]); if (!conv[0]) return res.status(404).json({ error: 'Not found' }); await query('INSERT INTO messages (conversationId, role, content, createdAt) VALUES (?, ?, ?, NOW())', [conversationId, 'user', content]); const [history] = await query('SELECT role, content FROM messages WHERE conversationId = ? ORDER BY createdAt', [conversationId]); const aiContent = generateAIResponse(content, history); const [result] = await query('INSERT INTO messages (conversationId, role, content, createdAt) VALUES (?, ?, ?, NOW())', [conversationId, 'assistant', aiContent]); await query('UPDATE conversations SET updatedAt = NOW() WHERE id = ?', [conversationId]); res.json({ messageId: result.insertId, content: aiContent, conversationId }); } catch (e) { res.status(500).json({ error: e.message }); } });
-
-initDb().then(() => { const PORT = process.env.PORT || 3000; app.listen(PORT, () => console.log(`Server running on port ${PORT}`)); });
+app.post('/api/rest/conversations/:userId', async (req, res) =>
