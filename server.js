@@ -13,7 +13,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 const CODE_EXPIRY_MS = 60 * 1000; // 60 seconds
 
-const hasDB = SUPABASE_URL && SUPABASE_ANON_KEY;
+const hasDB = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
 
 // ===== IN-MEMORY FALLBACK (when no DB) =====
 const memStore = {
@@ -498,7 +498,17 @@ app.get('/api/rest/auth/me', authMiddleware, async (req, res) => {
 // CHAT ROUTES
 // ==========================================
 
-app.get('/api/rest/health', (req, res) => res.json({ ok: true, auth: true, db: hasDB }));
+// Health check - shows DB connection status
+app.get('/api/rest/health', async (req, res) => {
+  let dbStatus = 'disabled';
+  if (hasDB) {
+    try {
+      const test = await dbQuery('users', 'find', { filter: 'id.eq.0' });
+      dbStatus = 'connected';
+    } catch (e) { dbStatus = 'error: ' + e.message; }
+  }
+  res.json({ ok: true, auth: true, db: hasDB, dbStatus, envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY } });
+});
 
 app.get('/api/rest/conversations', authMiddleware, async (req, res) => {
   try {
