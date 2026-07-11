@@ -61,26 +61,34 @@ function checkRateLimit(ip, maxAttempts = 5, windowMs = 60 * 1000) {
 }
 
 // ===== SUPABASE REST API HELPER =====
+// Filter format: { column: 'value' } or { column: 'operator.value' }
+// Examples: { email: 'test@test.com' } -> email=eq.test@test.com
+//           { id: 'eq.0' } -> id=eq.0
 async function dbQuery(table, action, options = {}) {
   if (!hasDB) return dbQueryMem(table, action, options);
   const { filter, body, method = 'GET', order, select = '*' } = options;
-  let url = `${SUPABASE_URL}/rest/v1/${table}?select=${select}`;
-  if (filter) url += '&' + filter;
-  if (order) url += '&order=' + order;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-      'Prefer': method === 'POST' ? 'return=representation' : undefined
-    },
-    body: body ? JSON.stringify(body) : undefined
-  });
+  const params = new URLSearchParams();
+  params.set('select', select);
+  if (filter) {
+    for (const [key, val] of Object.entries(filter)) {
+      params.set(key, val);
+    }
+  }
+  if (order) params.set('order', order);
+  const url = `${SUPABASE_URL}/rest/v1/${table}?${params.toString()}`;
+  const headers = {
+    'apikey': SUPABASE_ANON_KEY,
+    'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+    'Content-Type': 'application/json'
+  };
+  if (method === 'POST' || method === 'PATCH') {
+    headers['Prefer'] = 'return=representation';
+  }
+  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
   if (!res.ok) {
     const err = await res.text();
-    console.error('Supabase error:', table, action, err);
-    throw new Error('Database error');
+    console.error('Supabase error:', table, action, url, err);
+    throw new Error('Database error: ' + err.substring(0, 200));
   }
   const data = await res.json();
   return method === 'POST' && data[0] ? data[0] : data;
@@ -309,7 +317,7 @@ app.post('/api/rest/auth/verify-code', async (req, res) => {
 
     // Check if user already exists
     let users;
-    try { users = await dbQuery('users', 'find', { filter: `email.eq.${decoded.email}` }); } catch { users = []; }
+    try { users = await dbQuery('users', 'find', { filter: { email: 'eq.' + decoded.email } }); } catch { users = []; }
     const passwordToken = jwtEncode({ email: decoded.email, verified: true, exp: Date.now() + CODE_EXPIRY_MS });
     res.json({ message: 'Code verified!', passwordToken, hasAccount: users.length > 0 });
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
@@ -332,10 +340,10 @@ app.post('/api/rest/auth/set-password', async (req, res) => {
 
     let user;
     try {
-      const existing = await dbQuery('users', 'find', { filter: `email.eq.${email}` });
+      const existing = await dbQuery('users', 'find', { filter: { email: 'eq.' + email } });
       if (existing.length > 0) {
         // Update existing user's password
-        await dbQuery('users', 'update', { filter: `email.eq.${email}`, method: 'PATCH', body: { password_hash: passwordHash } });
+        await dbQuery('users', 'update', { filter: { email: 'eq.' + email }, method: 'PATCH', body: { password_hash: passwordHash } });
         user = { id: existing[0].id, email };
       } else {
         // Create new user
@@ -370,7 +378,7 @@ app.post('/api/rest/auth/login', async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
 
     let users;
-    try { users = await dbQuery('users', 'find', { filter: `email.eq.${email}` }); } catch { users = []; }
+    try { users = await dbQuery('users', 'find', { filter: { email: 'eq.' + email } }); } catch { users = []; }
     if (!users || users.length === 0) return res.status(401).json({ error: 'No account found with this email. Please sign up first.' });
 
     const passwordHash = hashPassword(password);
@@ -389,7 +397,7 @@ app.post('/api/rest/auth/forgot-password', async (req, res) => {
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
     let users;
-    try { users = await dbQuery('users', 'find', { filter: `email.eq.${email}` }); } catch { users = []; }
+    try { users = await dbQuery('users', 'find', { filter: { email: 'eq.' + email } }); } catch { users = []; }
     if (!users || users.length === 0) return res.status(404).json({ error: 'No account found with this email.' });
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -431,7 +439,7 @@ app.post('/api/rest/auth/reset-password', async (req, res) => {
 
     const passwordHash = hashPassword(password);
     try {
-      await dbQuery('users', 'update', { filter: `email.eq.${decoded.email}`, method: 'PATCH', body: { password_hash: passwordHash } });
+      await dbQuery('users', 'update', { filter: { email: 'eq.' + decoded.email }, method: 'PATCH', body: { password_hash: passwordHash } });
     } catch {
       const user = memStore.users.find(u => u.email === decoded.email);
       if (user) user.password_hash = passwordHash;
@@ -449,7 +457,7 @@ app.post('/api/rest/auth/change-password', authMiddleware, async (req, res) => {
     if (newPassword.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
 
     let users;
-    try { users = await dbQuery('users', 'find', { filter: `id.eq.${req.userId}` }); } catch { users = []; }
+    try { users = await dbQuery('users', 'find', { filter: { id: 'eq.' + req.userId } }); } catch { users = []; }
     if (!users || users.length === 0) return res.status(404).json({ error: 'User not found' });
 
     const currentHash = hashPassword(currentPassword);
@@ -457,7 +465,7 @@ app.post('/api/rest/auth/change-password', authMiddleware, async (req, res) => {
 
     const newHash = hashPassword(newPassword);
     try {
-      await dbQuery('users', 'update', { filter: `id.eq.${req.userId}`, method: 'PATCH', body: { password_hash: newHash } });
+      await dbQuery('users', 'update', { filter: { id: 'eq.' + req.userId }, method: 'PATCH', body: { password_hash: newHash } });
     } catch {
       const user = memStore.users.find(u => u.id === req.userId);
       if (user) user.password_hash = newHash;
@@ -471,12 +479,12 @@ app.delete('/api/rest/auth/account', authMiddleware, async (req, res) => {
   try {
     // Delete user's conversations and messages
     try {
-      const convs = await dbQuery('conversations', 'find', { filter: `user_id.eq.${req.userId}` });
+      const convs = await dbQuery('conversations', 'find', { filter: { user_id: 'eq.' + req.userId } });
       for (const c of convs) {
-        await dbQuery('messages', 'delete', { filter: `conversation_id.eq.${c.id}`, method: 'DELETE' });
+        await dbQuery('messages', 'delete', { filter: { conversation_id: 'eq.' + c.id }, method: 'DELETE' });
       }
-      await dbQuery('conversations', 'delete', { filter: `user_id.eq.${req.userId}`, method: 'DELETE' });
-      await dbQuery('users', 'delete', { filter: `id.eq.${req.userId}`, method: 'DELETE' });
+      await dbQuery('conversations', 'delete', { filter: { user_id: 'eq.' + req.userId }, method: 'DELETE' });
+      await dbQuery('users', 'delete', { filter: { id: 'eq.' + req.userId }, method: 'DELETE' });
     } catch {
       memStore.conversations = memStore.conversations.filter(c => c.user_id !== req.userId);
       memStore.messages = memStore.messages.filter(m => {
@@ -503,7 +511,7 @@ app.get('/api/rest/health', async (req, res) => {
   let dbStatus = 'disabled';
   if (hasDB) {
     try {
-      const test = await dbQuery('users', 'find', { filter: 'id.eq.0' });
+      const test = await dbQuery('users', 'find', { filter: { id: 'eq.0' } });
       dbStatus = 'connected';
     } catch (e) { dbStatus = 'error: ' + e.message; }
   }
@@ -512,16 +520,16 @@ app.get('/api/rest/health', async (req, res) => {
 
 app.get('/api/rest/conversations', authMiddleware, async (req, res) => {
   try {
-    const rows = await dbQuery('conversations', 'find', { filter: `user_id.eq.${req.userId}`, order: 'updated_at.desc' });
+    const rows = await dbQuery('conversations', 'find', { filter: { user_id: 'eq.' + req.userId }, order: 'updated_at.desc' });
     res.json(rows);
   } catch (e) { res.status(500).json({ error: 'Failed to load conversations' }); }
 });
 
 app.get('/api/rest/conversations/:id', authMiddleware, async (req, res) => {
   try {
-    const convs = await dbQuery('conversations', 'find', { filter: `id.eq.${req.params.id}` });
+    const convs = await dbQuery('conversations', 'find', { filter: { id: 'eq.' + req.params.id } });
     if (!convs || convs.length === 0 || convs[0].user_id !== req.userId) return res.status(404).json({ error: 'Not found' });
-    const msgs = await dbQuery('messages', 'find', { filter: `conversation_id.eq.${req.params.id}` });
+    const msgs = await dbQuery('messages', 'find', { filter: { conversation_id: 'eq.' + req.params.id } });
     res.json({ ...convs[0], messages: msgs });
   } catch (e) { res.status(500).json({ error: 'Failed to load conversation' }); }
 });
@@ -535,7 +543,7 @@ app.post('/api/rest/conversations', authMiddleware, async (req, res) => {
 
 app.delete('/api/rest/conversations/:id', authMiddleware, async (req, res) => {
   try {
-    await dbQuery('conversations', 'delete', { filter: `id.eq.${req.params.id}`, method: 'DELETE' });
+    await dbQuery('conversations', 'delete', { filter: { id: 'eq.' + req.params.id }, method: 'DELETE' });
     delete conversationTopics[req.params.id];
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to delete conversation' }); }
@@ -544,14 +552,14 @@ app.delete('/api/rest/conversations/:id', authMiddleware, async (req, res) => {
 app.post('/api/rest/messages', authMiddleware, async (req, res) => {
   try {
     const { conversationId, content } = req.body;
-    const convs = await dbQuery('conversations', 'find', { filter: `id.eq.${conversationId}` });
+    const convs = await dbQuery('conversations', 'find', { filter: { id: 'eq.' + conversationId } });
     if (!convs || convs.length === 0 || convs[0].user_id !== req.userId) return res.status(404).json({ error: 'Conversation not found' });
 
     await dbQuery('messages', 'create', { method: 'POST', body: { conversation_id: conversationId, role: 'user', content } });
-    const history = await dbQuery('messages', 'find', { filter: `conversation_id.eq.${conversationId}` });
+    const history = await dbQuery('messages', 'find', { filter: { conversation_id: 'eq.' + conversationId } });
     const aiContent = await generateAIResponse(content, history, conversationId);
     const result = await dbQuery('messages', 'create', { method: 'POST', body: { conversation_id: conversationId, role: 'assistant', content: aiContent } });
-    await dbQuery('conversations', 'update', { filter: `id.eq.${conversationId}`, method: 'PATCH', body: { updated_at: new Date().toISOString() } });
+    await dbQuery('conversations', 'update', { filter: { id: 'eq.' + conversationId }, method: 'PATCH', body: { updated_at: new Date().toISOString() } });
 
     res.json({ messageId: result.id, content: aiContent, conversationId });
   } catch (e) { res.status(500).json({ error: 'Failed to send message' }); }
