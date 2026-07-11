@@ -6,39 +6,41 @@ const app = express();
 app.use(cors({ origin: ['https://ahmadswork.com', 'https://www.ahmadswork.com'], credentials: true }));
 app.use(express.json());
 
-// ===== AUTH UTILITIES =====
+// ===== CONFIG =====
 const JWT_SECRET = process.env.JWT_SECRET || 'ahmad-dev-secret-key-2025';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const CODE_EXPIRY_MS = 60 * 1000; // 60 seconds
 
+// ===== JWT HELPERS =====
+function jwtEncode(payload) {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
+  return `${header}.${body}.${sig}`;
+}
+
+function jwtDecode(token) {
+  try {
+    const [h, b, s] = token.split('.');
+    const expected = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url');
+    if (s !== expected) return null;
+    return JSON.parse(Buffer.from(b, 'base64url').toString());
+  } catch { return null; }
+}
+
+// ===== PASSWORD HELPERS =====
 function hashPassword(password) {
   return crypto.createHash('sha256').update(password + JWT_SECRET).digest('hex');
 }
 
-function generateToken(userId, email) {
-  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const payload = Buffer.from(JSON.stringify({ userId, email, iat: Date.now() })).toString('base64url');
-  const signature = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${payload}`).digest('base64url');
-  return `${header}.${payload}.${signature}`;
-}
-
-function verifyToken(token) {
-  try {
-    const [header, payload, signature] = token.split('.');
-    const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${payload}`).digest('base64url');
-    if (signature !== expectedSig) return null;
-    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
-    return data;
-  } catch { return null; }
-}
-
+// ===== AUTH MIDDLEWARE =====
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  const token = authHeader.substring(7);
-  const decoded = verifyToken(token);
-  if (!decoded) return res.status(401).json({ error: 'Invalid token' });
+  const decoded = jwtDecode(authHeader.substring(7));
+  if (!decoded || !decoded.userId) return res.status(401).json({ error: 'Invalid token' });
   req.userId = decoded.userId;
   req.email = decoded.email;
   next();
@@ -46,7 +48,7 @@ function authMiddleware(req, res, next) {
 
 // ===== IN-MEMORY STORAGE =====
 const memStore = {
-  users: [],       // { id, email }
+  users: [],       // { id, email, passwordHash }
   conversations: [],
   messages: [],
   nextUserId: 1,
@@ -55,26 +57,8 @@ const memStore = {
 };
 const conversationTopics = {};
 
-// ===== EMAIL VERIFICATION CODES =====
-// { email: { code, expiresAt } }
-const verificationCodes = {};
-const CODE_EXPIRY_MS = 15 * 60 * 1000; // 15 minutes
-
-function generateCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit
-}
-
-function cleanupExpiredCodes() {
-  const now = Date.now();
-  for (const email of Object.keys(verificationCodes)) {
-    if (verificationCodes[email].expiresAt < now) {
-      delete verificationCodes[email];
-    }
-  }
-}
-
+// ===== EMAIL =====
 async function sendEmail(to, subject, html) {
-  // If Resend API key is configured, use it
   if (RESEND_API_KEY) {
     try {
       const res = await fetch('https://api.resend.com/emails', {
@@ -83,31 +67,19 @@ async function sendEmail(to, subject, html) {
           'Authorization': `Bearer ${RESEND_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          from: 'onboarding@resend.dev',
-          to,
-          subject,
-          html
-        })
+        body: JSON.stringify({ from: 'onboarding@resend.dev', to, subject, html })
       });
       const data = await res.json();
-      if (!res.ok) {
-        console.error('Resend error:', JSON.stringify(data));
-        return { error: data.message || JSON.stringify(data) };
-      }
+      if (!res.ok) return { error: data.message || JSON.stringify(data) };
       return { success: true };
-    } catch (e) {
-      console.error('Email send error:', e);
-      return false;
-    }
+    } catch (e) { return { error: e.message }; }
   }
-  // Fallback: log to console for testing
-  console.log('\n========== EMAIL (TEST MODE - No API Key) ==========');
+  console.log('\n========== EMAIL (TEST MODE) ==========');
   console.log('To:', to);
   console.log('Subject:', subject);
   console.log('Body:', html.replace(/<[^>]*>/g, ''));
-  console.log('=====================================================\n');
-  return true;
+  console.log('=======================================\n');
+  return { success: true };
 }
 
 // ===== QUERY HELPER =====
@@ -119,9 +91,18 @@ function query(sql, params) {
     return [memStore.users.filter(u => u.id == params[0])];
   }
   if (sql.includes('INSERT INTO users')) {
-    const row = { id: memStore.nextUserId++, email: params[0] };
+    const row = { id: memStore.nextUserId++ };
+    for (let i = 0; i < params.length; i++) {
+      if (sql.includes('email')) row.email = params[i];
+      if (sql.includes('passwordHash')) row.passwordHash = params[i];
+    }
     memStore.users.push(row);
     return [{ insertId: row.id }];
+  }
+  if (sql.includes('UPDATE users')) {
+    const user = memStore.users.find(u => u.id == params[1]);
+    if (user) user.passwordHash = params[0];
+    return [{}];
   }
   if (sql.includes('conversations WHERE userId =')) {
     return [memStore.conversations.filter(c => c.userId == params[0]).sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt))];
@@ -210,72 +191,108 @@ async function generateAIResponse(userMsg, history, conversationId) {
   return "I'm your AI assistant! I can help with JavaScript, React, Node.js, Python, SQL, web development, and career advice. What would you like to talk about?";
 }
 
-// ===== EMAIL VERIFICATION AUTH ROUTES =====
+// ===== AUTH ROUTES =====
 
-// Step 1: Request verification code
+// Step 1: Send verification code via email
 app.post('/api/rest/auth/send-code', async (req, res) => {
   try {
-    cleanupExpiredCodes();
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
-
-    // Validate email format
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) return res.status(400).json({ error: 'Invalid email format' });
 
-    const code = generateCode();
-    verificationCodes[email] = { code, expiresAt: Date.now() + CODE_EXPIRY_MS };
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
 
-    const emailSent = await sendEmail(
+    // Serverless-safe: return a verifyToken (JWT) that the client sends back
+    const verifyToken = jwtEncode({ email, codeHash, exp: Date.now() + CODE_EXPIRY_MS });
+
+    const result = await sendEmail(
       email,
-      'Your Login Code for Ahmad\'s Portfolio',
+      'Your Login Code - Ahmad\'s Portfolio',
       `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:40px auto;padding:32px;background:#0f0f11;color:#fafaf9;border-radius:8px;border:1px solid rgba(255,255,255,0.08)">
         <h2 style="color:#b45309;margin:0 0 8px;font-family:Georgia,serif">Ahmad's Portfolio</h2>
-        <p style="color:#78716c;margin:0 0 24px;font-size:14px">Use this code to sign in:</p>
+        <p style="color:#78716c;margin:0 0 24px;font-size:14px">Your login code (expires in 60 seconds):</p>
         <div style="background:rgba(180,83,9,0.1);border:1px solid rgba(180,83,9,0.3);border-radius:6px;padding:16px;text-align:center;margin-bottom:24px">
           <span style="font-family:'JetBrains Mono',monospace;font-size:28px;letter-spacing:8px;color:#b45309;font-weight:600">${code}</span>
         </div>
-        <p style="color:#78716c;font-size:12px;margin:0">This code expires in 15 minutes. If you didn't request this, you can ignore this email.</p>
+        <p style="color:#78716c;font-size:12px;margin:0">This code expires in 60 seconds. If you didn't request this, ignore this email.</p>
       </div>`
     );
 
-    if (!emailSent || emailSent.error) {
-      // Don't expose the code in production if email fails
-      if (RESEND_API_KEY) return res.status(500).json({ error: emailSent.error || 'Failed to send email. Try again.' });
-      // In test mode, return the code so user can see it
-      return res.json({ message: 'Code generated (test mode - check server logs)', testCode: code });
+    if (result.error) {
+      if (RESEND_API_KEY) return res.status(500).json({ error: result.error });
+      return res.json({ message: 'Test mode - check server logs', verifyToken, testCode: code });
     }
 
-    res.json({ message: 'Check your email for the login code' });
+    res.json({ message: 'Code sent! Check your email.', verifyToken });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Step 2: Verify code and log in
+// Step 2: Verify code
 app.post('/api/rest/auth/verify-code', async (req, res) => {
   try {
-    cleanupExpiredCodes();
-    const { email, code } = req.body;
-    if (!email || !code) return res.status(400).json({ error: 'Email and code are required' });
+    const { verifyToken, code } = req.body;
+    if (!verifyToken || !code) return res.status(400).json({ error: 'Token and code required' });
 
-    const record = verificationCodes[email];
-    if (!record) return res.status(400).json({ error: 'Code expired or not found. Please request a new one.' });
-    if (record.code !== code) return res.status(400).json({ error: 'Invalid code. Please try again.' });
+    const decoded = jwtDecode(verifyToken);
+    if (!decoded) return res.status(400).json({ error: 'Invalid token. Request a new code.' });
+    if (Date.now() > decoded.exp) return res.status(400).json({ error: 'Code expired. Request a new one.' });
 
-    // Code verified — find or create user
+    const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
+    if (codeHash !== decoded.codeHash) return res.status(400).json({ error: 'Invalid code. Try again.' });
+
+    // Code verified — return a password token for step 3
+    const passwordToken = jwtEncode({ email: decoded.email, verified: true, exp: Date.now() + CODE_EXPIRY_MS });
+    res.json({ message: 'Code verified. Create your password.', passwordToken });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Step 3: Set password and login
+app.post('/api/rest/auth/set-password', async (req, res) => {
+  try {
+    const { passwordToken, password } = req.body;
+    if (!passwordToken || !password) return res.status(400).json({ error: 'Token and password required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const decoded = jwtDecode(passwordToken);
+    if (!decoded || !decoded.verified) return res.status(400).json({ error: 'Invalid token. Start over.' });
+    if (Date.now() > decoded.exp) return res.status(400).json({ error: 'Session expired. Start over.' });
+
+    const email = decoded.email;
+    const passwordHash = hashPassword(password);
+
+    // Find or create user
     let [users] = query('SELECT * FROM users WHERE email = ?', [email]);
     let user;
     if (users.length === 0) {
-      const [result] = query('INSERT INTO users (email) VALUES (?)', [email]);
+      const [result] = query('INSERT INTO users (email, passwordHash) VALUES (?, ?)', [email, passwordHash]);
       user = { id: result.insertId, email };
     } else {
-      user = users[0];
+      // Update existing user's password
+      query('UPDATE users SET passwordHash = ? WHERE id = ?', [passwordHash, users[0].id]);
+      user = { id: users[0].id, email };
     }
 
-    // Clear the used code
-    delete verificationCodes[email];
-
-    const token = generateToken(user.id, user.email);
+    const token = jwtEncode({ userId: user.id, email: user.email });
     res.json({ token, user });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Login with email + password (returning users)
+app.post('/api/rest/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+    const [users] = query('SELECT * FROM users WHERE email = ?', [email]);
+    if (users.length === 0) return res.status(401).json({ error: 'Account not found. Sign up first.' });
+
+    const passwordHash = hashPassword(password);
+    if (passwordHash !== users[0].passwordHash) return res.status(401).json({ error: 'Wrong password. Try again.' });
+
+    const token = jwtEncode({ userId: users[0].id, email: users[0].email });
+    res.json({ token, user: { id: users[0].id, email: users[0].email } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -284,7 +301,7 @@ app.get('/api/rest/auth/me', authMiddleware, (req, res) => {
   res.json({ id: req.userId, email: req.email });
 });
 
-// ===== CHAT ROUTES (protected by auth) =====
+// ===== CHAT ROUTES =====
 
 app.get('/api/rest/health', (req, res) => res.json({ ok: true, auth: true }));
 
