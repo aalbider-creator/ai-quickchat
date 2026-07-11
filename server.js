@@ -87,8 +87,9 @@ async function dbQuery(table, action, options = {}) {
   const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
   if (!res.ok) {
     const err = await res.text();
-    console.error('Supabase error:', table, action, url, err);
-    throw new Error('Database error: ' + err.substring(0, 200));
+    console.error('Supabase error URL:', url);
+    console.error('Supabase error response:', err.substring(0, 500));
+    throw new Error('DB error: URL=' + SUPABASE_URL.substring(0, 30) + '... Status=' + res.status);
   }
   const data = await res.json();
   return method === 'POST' && data[0] ? data[0] : data;
