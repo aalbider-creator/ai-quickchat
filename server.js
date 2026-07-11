@@ -18,9 +18,6 @@ function query(sql, params) {
   if (sql.includes('messages WHERE conversationId = ? ORDER BY createdAt')) {
     return [memStore.messages.filter(m => m.conversationId == params[0]).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt))];
   }
-  if (sql.includes('role, content FROM messages')) {
-    return [memStore.messages.filter(m => m.conversationId == params[0]).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt))];
-  }
   if (sql.includes('INSERT INTO conversations')) {
     const row = { id: memStore.nextConvId++, userId: params[0], title: params[1], createdAt: new Date(), updatedAt: new Date() };
     memStore.conversations.push(row); return [{ insertId: row.id }];
@@ -42,51 +39,49 @@ function query(sql, params) {
   return [[]];
 }
 
+// Real AI via Groq API (Llama 3)
 async function generateAIResponse(userMsg, history) {
-  const lower = userMsg.toLowerCase().trim();
-  
-  // Inappropriate content filter
-  if (/(penis|sex|porn|nude|naked|kill|murder|terrorist|bomb|hack|crack|steal|illegal)/.test(lower)) {
-    return "I'm designed to help with coding, tech, and career questions. Let's keep it professional! Ask me about JavaScript, React, Node.js, Python, or web development.";
+  // Content filter
+  const lower = userMsg.toLowerCase();
+  if (/(penis|sex|porn|nude|kill|murder|terrorist|bomb)/.test(lower)) {
+    return "Let's keep it professional! Ask me about coding, tech, or career advice.";
   }
-  
-  // Coding help
-  if (/(javascript|js|react|node|python|html|css|sql|bug|error|debug|function|variable|loop|array|object|api|database)/.test(lower)) {
-    if (lower.includes('javascript') || lower.includes('js')) return "JavaScript powers the web! Start with variables (let/const), arrow functions, and async/await. The event loop is key to understanding how JS works. Want me to explain any of these?";
-    if (lower.includes('react')) return "React is all about components and hooks. useState manages state, useEffect handles side effects. JSX lets you write HTML inside JavaScript. What React concept are you struggling with?";
-    if (lower.includes('python')) return "Python reads like English — great for beginners! For data science: pandas + numpy. For web backends: FastAPI or Flask. For ML: scikit-learn + TensorFlow. What's your goal?";
-    if (lower.includes('node')) return "Node.js runs JavaScript on the server. Use Express to build APIs, npm for packages, and connect to databases like MySQL or MongoDB. This very chat app uses Node.js + Express!";
-    if (lower.includes('sql')) return "SQL is how you talk to databases. SELECT reads data, INSERT adds, UPDATE changes, DELETE removes. JOINs combine tables. Every web app needs database knowledge — practice writing real queries!";
-    if (lower.includes('bug') || lower.includes('error') || lower.includes('debug')) return "Debugging is a superpower! 1) Read the error message twice. 2) Use console.log() to trace values. 3) Comment out code to isolate the issue. 4) Google the exact error. What's your error message?";
-    if (lower.includes('api')) return "APIs let frontend and backend talk. REST APIs use GET (read), POST (create), PUT (update), DELETE (remove). This chat app uses a REST API to send messages to the server. Want to learn how to build one?";
-    return "Great coding question! I can help with JavaScript, React, Node.js, Python, SQL, HTML/CSS, and more. What's the specific problem you're working on?";
+
+  if (!process.env.GROQ_API_KEY) {
+    return "Add GROQ_API_KEY to Vercel environment variables. Get a free key at console.groq.com";
   }
-  
-  // About the app
-  if (/(who are you|what are you|what is this)/.test(lower)) return "I'm an AI assistant in this chat app. The app is built with: HTML/CSS/JS frontend (on Namecheap), Node.js + Express backend (on Vercel), and this smart response engine. It's a real full-stack project!";
-  if (/(how.*work|tech stack|architecture|backend|frontend)/.test(lower)) return "Tech stack breakdown: Frontend = HTML/CSS/JS deployed on Namecheap. Backend = Node.js + Express on Vercel (serverless). API = REST with CORS. Storage = in-memory database. This is how real web apps are architected!";
-  
-  // Greetings
-  if (/^(hi|hello|hey|yo|sup|howdy)/.test(lower)) return "Hey there! 👋 I'm your AI coding assistant. Ask me about JavaScript, React, Node.js, Python, SQL, web development, or tech careers!";
-  
-  // Career/learning
-  if (/(career|job|interview|portfolio|hire|learn|study|degree)/.test(lower)) return "For tech careers: 1) Build projects like this chat app. 2) Deploy them with live links. 3) Put links on your resume. 4) Practice data structures on LeetCode. 5) Contribute to open source. This app alone proves full-stack skills!";
-  
-  // Thanks/goodbye
-  if (/(thank|thanks)/.test(lower)) return "You're welcome! Happy coding! 🚀 Keep building and deploying!";
-  if (/(bye|goodbye|see you|later)/.test(lower)) return "Goodbye! Your conversations are saved. Come back anytime and keep building cool stuff!";
-  
-  // Context-aware based on conversation length
-  const convLength = history.length;
-  if (convLength > 6) return "We've been chatting for a while! Based on our conversation, you're clearly interested in tech. What project are you building right now? I'd love to help.";
-  if (convLength > 3) return "Got it! I'm here to help with coding questions, explain tech concepts, or give career advice. What would you like to dive into?";
-  
-  // Default
-  return "I'm your AI assistant for this chat app! I can help with JavaScript, React, Node.js, Python, SQL, web development, and career advice. What would you like to talk about?";
+
+  try {
+    const messages = [
+      { role: 'system', content: 'You are a helpful AI coding assistant. Help with JavaScript, React, Node.js, Python, SQL, web development, and tech careers. Be concise but thorough. Use code examples when helpful.' },
+      ...history.slice(-10).map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content })),
+      { role: 'user', content: userMsg }
+    ];
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages: messages,
+        temperature: 0.7,
+        max_tokens: 800
+      })
+    });
+
+    if (!response.ok) throw new Error(`API error: ${response.status}`);
+    const data = await response.json();
+    return data.choices[0].message.content;
+  } catch (e) {
+    console.log('Groq error:', e.message);
+    return "AI service temporarily unavailable. Try again in a moment!";
+  }
 }
 
-// Routes
-app.get('/api/rest/health', (req, res) => res.json({ ok: true }));
+app.get('/api/rest/health', (req, res) => res.json({ ok: true, ai: !!process.env.GROQ_API_KEY }));
 
 app.get('/api/rest/conversations/:userId', async (req, res) => { try { const [rows] = query('SELECT * FROM conversations WHERE userId = ? ORDER BY updatedAt DESC', [req.params.userId]); res.json(rows); } catch (e) { res.status(500).json({ error: e.message }); } });
 
