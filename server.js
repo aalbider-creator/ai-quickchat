@@ -84,7 +84,7 @@ async function sendEmail(to, subject, html) {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          from: 'Ahmad\'s Portfolio <noreply@ahmadswork.com>',
+          from: 'onboarding@resend.dev',
           to,
           subject,
           html
@@ -92,10 +92,10 @@ async function sendEmail(to, subject, html) {
       });
       const data = await res.json();
       if (!res.ok) {
-        console.error('Resend error:', data);
-        return false;
+        console.error('Resend error:', JSON.stringify(data));
+        return { error: data.message || JSON.stringify(data) };
       }
-      return true;
+      return { success: true };
     } catch (e) {
       console.error('Email send error:', e);
       return false;
@@ -239,9 +239,9 @@ app.post('/api/rest/auth/send-code', async (req, res) => {
       </div>`
     );
 
-    if (!emailSent) {
+    if (!emailSent || emailSent.error) {
       // Don't expose the code in production if email fails
-      if (RESEND_API_KEY) return res.status(500).json({ error: 'Failed to send email. Please try again.' });
+      if (RESEND_API_KEY) return res.status(500).json({ error: emailSent.error || 'Failed to send email. Try again.' });
       // In test mode, return the code so user can see it
       return res.json({ message: 'Code generated (test mode - check server logs)', testCode: code });
     }
