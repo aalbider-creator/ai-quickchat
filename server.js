@@ -9,7 +9,19 @@ app.use(express.json());
 // ===== CONFIG =====
 const JWT_SECRET = process.env.JWT_SECRET || 'ahmad-dev-secret-key-2025';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 const CODE_EXPIRY_MS = 60 * 1000; // 60 seconds
+
+const hasDB = SUPABASE_URL && SUPABASE_ANON_KEY;
+
+// ===== IN-MEMORY FALLBACK (when no DB) =====
+const memStore = {
+  users: [], conversations: [], messages: [],
+  nextUserId: 1, nextConvId: 1, nextMsgId: 1
+};
+const conversationTopics = {};
+const rateLimitMap = new Map(); // IP -> { count, resetAt }
 
 // ===== JWT HELPERS =====
 function jwtEncode(payload) {
@@ -18,7 +30,6 @@ function jwtEncode(payload) {
   const sig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
   return `${header}.${body}.${sig}`;
 }
-
 function jwtDecode(token) {
   try {
     const [h, b, s] = token.split('.');
@@ -28,34 +39,129 @@ function jwtDecode(token) {
   } catch { return null; }
 }
 
-// ===== PASSWORD HELPERS =====
+// ===== PASSWORD =====
 function hashPassword(password) {
   return crypto.createHash('sha256').update(password + JWT_SECRET).digest('hex');
 }
 
-// ===== AUTH MIDDLEWARE =====
-function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized' });
+// ===== RATE LIMITING =====
+function checkRateLimit(ip, maxAttempts = 5, windowMs = 60 * 1000) {
+  const now = Date.now();
+  const record = rateLimitMap.get(ip);
+  if (!record || now > record.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + windowMs });
+    return { allowed: true };
   }
-  const decoded = jwtDecode(authHeader.substring(7));
-  if (!decoded || !decoded.userId) return res.status(401).json({ error: 'Invalid token' });
-  req.userId = decoded.userId;
-  req.email = decoded.email;
-  next();
+  if (record.count >= maxAttempts) {
+    const secondsLeft = Math.ceil((record.resetAt - now) / 1000);
+    return { allowed: false, retryAfter: secondsLeft };
+  }
+  record.count++;
+  return { allowed: true };
 }
 
-// ===== IN-MEMORY STORAGE =====
-const memStore = {
-  users: [],       // { id, email, passwordHash }
-  conversations: [],
-  messages: [],
-  nextUserId: 1,
-  nextConvId: 1,
-  nextMsgId: 1
-};
-const conversationTopics = {};
+// ===== SUPABASE REST API HELPER =====
+async function dbQuery(table, action, options = {}) {
+  if (!hasDB) return dbQueryMem(table, action, options);
+  const { filter, body, method = 'GET', order, select = '*' } = options;
+  let url = `${SUPABASE_URL}/rest/v1/${table}?select=${select}`;
+  if (filter) url += '&' + filter;
+  if (order) url += '&order=' + order;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,
+      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+      'Prefer': method === 'POST' ? 'return=representation' : undefined
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    console.error('Supabase error:', table, action, err);
+    throw new Error('Database error');
+  }
+  const data = await res.json();
+  return method === 'POST' && data[0] ? data[0] : data;
+}
+
+// ===== IN-MEMORY FALLBACK DB =====
+async function dbQueryMem(table, action, options) {
+  const { filter, body, method = 'GET', order } = options;
+  if (table === 'users') {
+    if (method === 'POST' && action === 'create') {
+      const row = { id: memStore.nextUserId++, ...body, created_at: new Date().toISOString() };
+      if (body.password_hash) row.password_hash = body.password_hash;
+      memStore.users.push(row);
+      return row;
+    }
+    if (method === 'PATCH' && action === 'update') {
+      const parts = filter.split('.');
+      const field = parts[0].replace('eq.', '');
+      const val = parts[1] || filter.split('eq.')[1];
+      const user = memStore.users.find(u => u.email === val || u.id == val);
+      if (user) Object.assign(user, body);
+      return user;
+    }
+    if (filter && filter.includes('eq.')) {
+      const val = filter.split('eq.')[1];
+      return memStore.users.filter(u => u.email === val || u.id == val);
+    }
+    return memStore.users;
+  }
+  if (table === 'conversations') {
+    if (method === 'POST') {
+      const row = { id: memStore.nextConvId++, ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+      memStore.conversations.push(row); return row;
+    }
+    if (method === 'DELETE') {
+      const convId = parseInt(filter.split('eq.')[1]);
+      memStore.conversations = memStore.conversations.filter(c => c.id !== convId);
+      memStore.messages = memStore.messages.filter(m => m.conversation_id !== convId);
+      delete conversationTopics[convId];
+      return { success: true };
+    }
+    if (method === 'PATCH') {
+      const convId = parseInt(filter.split('eq.')[1]);
+      const conv = memStore.conversations.find(c => c.id === convId);
+      if (conv) { conv.updated_at = new Date().toISOString(); if (body.title) conv.title = body.title; }
+      return conv;
+    }
+    if (filter) {
+      const userId = parseInt(filter.split('eq.')[1]);
+      let rows = memStore.conversations.filter(c => c.user_id === userId);
+      if (order) rows = rows.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+      return rows;
+    }
+    return memStore.conversations;
+  }
+  if (table === 'messages') {
+    if (method === 'POST') {
+      const row = { id: memStore.nextMsgId++, ...body, created_at: new Date().toISOString() };
+      memStore.messages.push(row); return row;
+    }
+    if (filter) {
+      const convId = parseInt(filter.split('eq.')[1]);
+      return memStore.messages.filter(m => m.conversation_id === convId).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    }
+    return memStore.messages;
+  }
+  if (table === 'password_resets') {
+    if (method === 'POST') {
+      memStore.passwordResets = memStore.passwordResets || [];
+      memStore.passwordResets.push({ ...body, created_at: new Date().toISOString() });
+      return body;
+    }
+    if (filter) {
+      memStore.passwordResets = memStore.passwordResets || [];
+      const email = filter.split('eq.')[1];
+      return memStore.passwordResets.filter(r => r.email === email);
+    }
+    return memStore.passwordResets || [];
+  }
+  return [];
+}
 
 // ===== EMAIL =====
 async function sendEmail(to, subject, html) {
@@ -63,10 +169,7 @@ async function sendEmail(to, subject, html) {
     try {
       const res = await fetch('https://api.resend.com/emails', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${RESEND_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ from: 'onboarding@resend.dev', to, subject, html })
       });
       const data = await res.json();
@@ -77,66 +180,22 @@ async function sendEmail(to, subject, html) {
   console.log('\n========== EMAIL (TEST MODE) ==========');
   console.log('To:', to);
   console.log('Subject:', subject);
-  console.log('Body:', html.replace(/<[^>]*>/g, ''));
+  console.log('Code:', html.match(/\d{6}/)?.[0] || 'N/A');
   console.log('=======================================\n');
   return { success: true };
 }
 
-// ===== QUERY HELPER =====
-function query(sql, params) {
-  if (sql.includes('users WHERE email =')) {
-    return [memStore.users.filter(u => u.email === params[0])];
+// ===== AUTH MIDDLEWARE =====
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized. Please log in.' });
   }
-  if (sql.includes('users WHERE id =')) {
-    return [memStore.users.filter(u => u.id == params[0])];
-  }
-  if (sql.includes('INSERT INTO users')) {
-    const row = { id: memStore.nextUserId++ };
-    for (let i = 0; i < params.length; i++) {
-      if (sql.includes('email')) row.email = params[i];
-      if (sql.includes('passwordHash')) row.passwordHash = params[i];
-    }
-    memStore.users.push(row);
-    return [{ insertId: row.id }];
-  }
-  if (sql.includes('UPDATE users')) {
-    const user = memStore.users.find(u => u.id == params[1]);
-    if (user) user.passwordHash = params[0];
-    return [{}];
-  }
-  if (sql.includes('conversations WHERE userId =')) {
-    return [memStore.conversations.filter(c => c.userId == params[0]).sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt))];
-  }
-  if (sql.includes('conversations WHERE id = ? AND userId =')) {
-    return [memStore.conversations.filter(c => c.id == params[0] && c.userId == params[1])];
-  }
-  if (sql.includes('messages WHERE conversationId = ? ORDER BY createdAt')) {
-    return [memStore.messages.filter(m => m.conversationId == params[0]).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt))];
-  }
-  if (sql.includes('role, content FROM messages')) {
-    return [memStore.messages.filter(m => m.conversationId == params[0]).sort((a,b) => new Date(a.createdAt) - new Date(b.createdAt))];
-  }
-  if (sql.includes('INSERT INTO conversations')) {
-    const row = { id: memStore.nextConvId++, userId: params[0], title: params[1], createdAt: new Date(), updatedAt: new Date() };
-    memStore.conversations.push(row); return [{ insertId: row.id }];
-  }
-  if (sql.includes('INSERT INTO messages')) {
-    const row = { id: memStore.nextMsgId++, conversationId: params[0], role: params[1], content: params[2], createdAt: new Date() };
-    memStore.messages.push(row); return [{ insertId: row.id }];
-  }
-  if (sql.includes('DELETE FROM messages')) {
-    memStore.messages = memStore.messages.filter(m => m.conversationId != params[0]); return [{}];
-  }
-  if (sql.includes('DELETE FROM conversations')) {
-    memStore.conversations = memStore.conversations.filter(c => c.id != params[0]);
-    delete conversationTopics[params[0]];
-    return [{}];
-  }
-  if (sql.includes('UPDATE conversations')) {
-    const conv = memStore.conversations.find(c => c.id == params[0]);
-    if (conv) conv.updatedAt = new Date(); return [{}];
-  }
-  return [[]];
+  const decoded = jwtDecode(authHeader.substring(7));
+  if (!decoded || !decoded.userId) return res.status(401).json({ error: 'Invalid or expired session. Please log in again.' });
+  req.userId = decoded.userId;
+  req.email = decoded.email;
+  next();
 }
 
 // ===== AI RESPONSE ENGINE =====
@@ -191,28 +250,35 @@ async function generateAIResponse(userMsg, history, conversationId) {
   return "I'm your AI assistant! I can help with JavaScript, React, Node.js, Python, SQL, web development, and career advice. What would you like to talk about?";
 }
 
-// ===== AUTH ROUTES =====
+// ==========================================
+// AUTH ROUTES
+// ==========================================
 
-// Step 1: Send verification code via email
+// Helper: get client IP
+function getClientIp(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+}
+
+// Step 1: Send verification code
 app.post('/api/rest/auth/send-code', async (req, res) => {
   try {
     const { email } = req.body;
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(ip, 5, 60 * 1000);
+    if (!limit.allowed) return res.status(429).json({ error: `Too many attempts. Try again in ${limit.retryAfter} seconds.` });
+
     if (!email) return res.status(400).json({ error: 'Email is required' });
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) return res.status(400).json({ error: 'Invalid email format' });
+    if (!emailRegex.test(email)) return res.status(400).json({ error: 'Please enter a valid email address' });
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
-
-    // Serverless-safe: return a verifyToken (JWT) that the client sends back
     const verifyToken = jwtEncode({ email, codeHash, exp: Date.now() + CODE_EXPIRY_MS });
 
-    const result = await sendEmail(
-      email,
-      'Your Login Code - Ahmad\'s Portfolio',
+    const result = await sendEmail(email, 'Your Login Code - Ahmad\'s Portfolio',
       `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:40px auto;padding:32px;background:#0f0f11;color:#fafaf9;border-radius:8px;border:1px solid rgba(255,255,255,0.08)">
         <h2 style="color:#b45309;margin:0 0 8px;font-family:Georgia,serif">Ahmad's Portfolio</h2>
-        <p style="color:#78716c;margin:0 0 24px;font-size:14px">Your login code (expires in 60 seconds):</p>
+        <p style="color:#78716c;margin:0 0 24px;font-size:14px">Your verification code (expires in 60 seconds):</p>
         <div style="background:rgba(180,83,9,0.1);border:1px solid rgba(180,83,9,0.3);border-radius:6px;padding:16px;text-align:center;margin-bottom:24px">
           <span style="font-family:'JetBrains Mono',monospace;font-size:28px;letter-spacing:8px;color:#b45309;font-weight:600">${code}</span>
         </div>
@@ -224,131 +290,261 @@ app.post('/api/rest/auth/send-code', async (req, res) => {
       if (RESEND_API_KEY) return res.status(500).json({ error: result.error });
       return res.json({ message: 'Test mode - check server logs', verifyToken, testCode: code });
     }
-
     res.json({ message: 'Code sent! Check your email.', verifyToken });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
 // Step 2: Verify code
 app.post('/api/rest/auth/verify-code', async (req, res) => {
   try {
     const { verifyToken, code } = req.body;
-    if (!verifyToken || !code) return res.status(400).json({ error: 'Token and code required' });
+    if (!verifyToken || !code) return res.status(400).json({ error: 'Verification token and code are required' });
 
     const decoded = jwtDecode(verifyToken);
-    if (!decoded) return res.status(400).json({ error: 'Invalid token. Request a new code.' });
-    if (Date.now() > decoded.exp) return res.status(400).json({ error: 'Code expired. Request a new one.' });
+    if (!decoded) return res.status(400).json({ error: 'Invalid verification link. Please request a new code.' });
+    if (Date.now() > decoded.exp) return res.status(400).json({ error: 'Code expired. Please request a new one.' });
 
     const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
-    if (codeHash !== decoded.codeHash) return res.status(400).json({ error: 'Invalid code. Try again.' });
+    if (codeHash !== decoded.codeHash) return res.status(400).json({ error: 'Incorrect code. Please try again.' });
 
-    // Code verified — return a password token for step 3
+    // Check if user already exists
+    let users;
+    try { users = await dbQuery('users', 'find', { filter: `email.eq.${decoded.email}` }); } catch { users = []; }
     const passwordToken = jwtEncode({ email: decoded.email, verified: true, exp: Date.now() + CODE_EXPIRY_MS });
-    res.json({ message: 'Code verified. Create your password.', passwordToken });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ message: 'Code verified!', passwordToken, hasAccount: users.length > 0 });
+  } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
-// Step 3: Set password and login
+// Step 3: Set password (new account)
 app.post('/api/rest/auth/set-password', async (req, res) => {
   try {
     const { passwordToken, password } = req.body;
-    if (!passwordToken || !password) return res.status(400).json({ error: 'Token and password required' });
+    if (!passwordToken || !password) return res.status(400).json({ error: 'Token and password are required' });
     if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    if (password.length > 128) return res.status(400).json({ error: 'Password too long' });
 
     const decoded = jwtDecode(passwordToken);
-    if (!decoded || !decoded.verified) return res.status(400).json({ error: 'Invalid token. Start over.' });
-    if (Date.now() > decoded.exp) return res.status(400).json({ error: 'Session expired. Start over.' });
+    if (!decoded || !decoded.verified) return res.status(400).json({ error: 'Invalid session. Please start over.' });
+    if (Date.now() > decoded.exp) return res.status(400).json({ error: 'Session expired. Please start over.' });
 
     const email = decoded.email;
     const passwordHash = hashPassword(password);
 
-    // Find or create user
-    let [users] = query('SELECT * FROM users WHERE email = ?', [email]);
     let user;
-    if (users.length === 0) {
-      const [result] = query('INSERT INTO users (email, passwordHash) VALUES (?, ?)', [email, passwordHash]);
-      user = { id: result.insertId, email };
-    } else {
-      // Update existing user's password
-      query('UPDATE users SET passwordHash = ? WHERE id = ?', [passwordHash, users[0].id]);
-      user = { id: users[0].id, email };
+    try {
+      const existing = await dbQuery('users', 'find', { filter: `email.eq.${email}` });
+      if (existing.length > 0) {
+        // Update existing user's password
+        await dbQuery('users', 'update', { filter: `email.eq.${email}`, method: 'PATCH', body: { password_hash: passwordHash } });
+        user = { id: existing[0].id, email };
+      } else {
+        // Create new user
+        user = await dbQuery('users', 'create', { method: 'POST', body: { email, password_hash: passwordHash } });
+      }
+    } catch {
+      // Fallback: create in memory
+      const existing = memStore.users.find(u => u.email === email);
+      if (existing) {
+        existing.password_hash = passwordHash;
+        user = { id: existing.id, email };
+      } else {
+        const row = { id: memStore.nextUserId++, email, password_hash: passwordHash, created_at: new Date().toISOString() };
+        memStore.users.push(row);
+        user = { id: row.id, email };
+      }
     }
 
     const token = jwtEncode({ userId: user.id, email: user.email });
-    res.json({ token, user });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ token, user: { id: user.id, email: user.email } });
+  } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
-// Login with email + password (returning users)
+// Login with email + password
 app.post('/api/rest/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(ip + ':login', 5, 60 * 1000);
+    if (!limit.allowed) return res.status(429).json({ error: `Too many failed attempts. Try again in ${limit.retryAfter} seconds.` });
 
-    const [users] = query('SELECT * FROM users WHERE email = ?', [email]);
-    if (users.length === 0) return res.status(401).json({ error: 'Account not found. Sign up first.' });
+    if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+
+    let users;
+    try { users = await dbQuery('users', 'find', { filter: `email.eq.${email}` }); } catch { users = []; }
+    if (!users || users.length === 0) return res.status(401).json({ error: 'No account found with this email. Please sign up first.' });
 
     const passwordHash = hashPassword(password);
-    if (passwordHash !== users[0].passwordHash) return res.status(401).json({ error: 'Wrong password. Try again.' });
+    const user = users[0];
+    if (passwordHash !== user.password_hash) return res.status(401).json({ error: 'Incorrect password. Please try again.' });
 
-    const token = jwtEncode({ userId: users[0].id, email: users[0].email });
-    res.json({ token, user: { id: users[0].id, email: users[0].email } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const token = jwtEncode({ userId: user.id, email: user.email });
+    res.json({ token, user: { id: user.id, email: user.email } });
+  } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
+});
+
+// Forgot password: send reset code
+app.post('/api/rest/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    let users;
+    try { users = await dbQuery('users', 'find', { filter: `email.eq.${email}` }); } catch { users = []; }
+    if (!users || users.length === 0) return res.status(404).json({ error: 'No account found with this email.' });
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
+    const resetToken = jwtEncode({ email, codeHash, exp: Date.now() + CODE_EXPIRY_MS });
+
+    const result = await sendEmail(email, 'Password Reset - Ahmad\'s Portfolio',
+      `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:40px auto;padding:32px;background:#0f0f11;color:#fafaf9;border-radius:8px;border:1px solid rgba(255,255,255,0.08)">
+        <h2 style="color:#b45309;margin:0 0 8px;font-family:Georgia,serif">Password Reset</h2>
+        <p style="color:#78716c;margin:0 0 24px;font-size:14px">Your password reset code (expires in 60 seconds):</p>
+        <div style="background:rgba(180,83,9,0.1);border:1px solid rgba(180,83,9,0.3);border-radius:6px;padding:16px;text-align:center;margin-bottom:24px">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:28px;letter-spacing:8px;color:#b45309;font-weight:600">${code}</span>
+        </div>
+        <p style="color:#78716c;font-size:12px;margin:0">If you didn't request this, ignore this email.</p>
+      </div>`
+    );
+
+    if (result.error) {
+      if (RESEND_API_KEY) return res.status(500).json({ error: result.error });
+      return res.json({ message: 'Test mode', resetToken, testCode: code });
+    }
+    res.json({ message: 'Reset code sent! Check your email.', resetToken });
+  } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
+});
+
+// Reset password with code
+app.post('/api/rest/auth/reset-password', async (req, res) => {
+  try {
+    const { resetToken, code, password } = req.body;
+    if (!resetToken || !code || !password) return res.status(400).json({ error: 'All fields are required' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const decoded = jwtDecode(resetToken);
+    if (!decoded) return res.status(400).json({ error: 'Invalid token. Please request a new code.' });
+    if (Date.now() > decoded.exp) return res.status(400).json({ error: 'Code expired. Please request a new one.' });
+
+    const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
+    if (codeHash !== decoded.codeHash) return res.status(400).json({ error: 'Incorrect code. Please try again.' });
+
+    const passwordHash = hashPassword(password);
+    try {
+      await dbQuery('users', 'update', { filter: `email.eq.${decoded.email}`, method: 'PATCH', body: { password_hash: passwordHash } });
+    } catch {
+      const user = memStore.users.find(u => u.email === decoded.email);
+      if (user) user.password_hash = passwordHash;
+    }
+
+    res.json({ message: 'Password updated! You can now log in.' });
+  } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
+});
+
+// Change password (logged in)
+app.post('/api/rest/auth/change-password', authMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Both passwords are required' });
+    if (newPassword.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
+
+    let users;
+    try { users = await dbQuery('users', 'find', { filter: `id.eq.${req.userId}` }); } catch { users = []; }
+    if (!users || users.length === 0) return res.status(404).json({ error: 'User not found' });
+
+    const currentHash = hashPassword(currentPassword);
+    if (currentHash !== users[0].password_hash) return res.status(401).json({ error: 'Current password is incorrect' });
+
+    const newHash = hashPassword(newPassword);
+    try {
+      await dbQuery('users', 'update', { filter: `id.eq.${req.userId}`, method: 'PATCH', body: { password_hash: newHash } });
+    } catch {
+      const user = memStore.users.find(u => u.id === req.userId);
+      if (user) user.password_hash = newHash;
+    }
+    res.json({ message: 'Password changed successfully' });
+  } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
+});
+
+// Delete account
+app.delete('/api/rest/auth/account', authMiddleware, async (req, res) => {
+  try {
+    // Delete user's conversations and messages
+    try {
+      const convs = await dbQuery('conversations', 'find', { filter: `user_id.eq.${req.userId}` });
+      for (const c of convs) {
+        await dbQuery('messages', 'delete', { filter: `conversation_id.eq.${c.id}`, method: 'DELETE' });
+      }
+      await dbQuery('conversations', 'delete', { filter: `user_id.eq.${req.userId}`, method: 'DELETE' });
+      await dbQuery('users', 'delete', { filter: `id.eq.${req.userId}`, method: 'DELETE' });
+    } catch {
+      memStore.conversations = memStore.conversations.filter(c => c.user_id !== req.userId);
+      memStore.messages = memStore.messages.filter(m => {
+        const conv = memStore.conversations.find(c => c.id === m.conversation_id);
+        return conv;
+      });
+      memStore.users = memStore.users.filter(u => u.id !== req.userId);
+    }
+    res.json({ message: 'Account deleted' });
+  } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
 // Get current user
-app.get('/api/rest/auth/me', authMiddleware, (req, res) => {
+app.get('/api/rest/auth/me', authMiddleware, async (req, res) => {
   res.json({ id: req.userId, email: req.email });
 });
 
-// ===== CHAT ROUTES =====
+// ==========================================
+// CHAT ROUTES
+// ==========================================
 
-app.get('/api/rest/health', (req, res) => res.json({ ok: true, auth: true }));
+app.get('/api/rest/health', (req, res) => res.json({ ok: true, auth: true, db: hasDB }));
 
 app.get('/api/rest/conversations', authMiddleware, async (req, res) => {
-  try { const [rows] = query('SELECT * FROM conversations WHERE userId = ? ORDER BY updatedAt DESC', [req.userId]); res.json(rows); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    const rows = await dbQuery('conversations', 'find', { filter: `user_id.eq.${req.userId}`, order: 'updated_at.desc' });
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: 'Failed to load conversations' }); }
 });
 
 app.get('/api/rest/conversations/:id', authMiddleware, async (req, res) => {
   try {
-    const [conv] = query('SELECT * FROM conversations WHERE id = ? AND userId = ?', [req.params.id, req.userId]);
-    if (!conv[0]) return res.status(404).json({ error: 'Not found' });
-    const [msgs] = query('SELECT * FROM messages WHERE conversationId = ? ORDER BY createdAt', [req.params.id]);
-    res.json({ ...conv[0], messages: msgs });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const convs = await dbQuery('conversations', 'find', { filter: `id.eq.${req.params.id}` });
+    if (!convs || convs.length === 0 || convs[0].user_id !== req.userId) return res.status(404).json({ error: 'Not found' });
+    const msgs = await dbQuery('messages', 'find', { filter: `conversation_id.eq.${req.params.id}` });
+    res.json({ ...convs[0], messages: msgs });
+  } catch (e) { res.status(500).json({ error: 'Failed to load conversation' }); }
 });
 
 app.post('/api/rest/conversations', authMiddleware, async (req, res) => {
   try {
-    const [result] = query('INSERT INTO conversations (userId, title, createdAt, updatedAt) VALUES (?, ?, NOW(), NOW())', [req.userId, req.body.title]);
-    res.json({ id: result.insertId, userId: req.userId, title: req.body.title, createdAt: new Date(), updatedAt: new Date() });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const result = await dbQuery('conversations', 'create', { method: 'POST', body: { user_id: req.userId, title: req.body.title || 'New Chat' } });
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: 'Failed to create conversation' }); }
 });
 
 app.delete('/api/rest/conversations/:id', authMiddleware, async (req, res) => {
   try {
-    query('DELETE FROM messages WHERE conversationId = ?', [req.params.id]);
-    query('DELETE FROM conversations WHERE id = ?', [req.params.id]);
+    await dbQuery('conversations', 'delete', { filter: `id.eq.${req.params.id}`, method: 'DELETE' });
     delete conversationTopics[req.params.id];
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: 'Failed to delete conversation' }); }
 });
 
 app.post('/api/rest/messages', authMiddleware, async (req, res) => {
   try {
     const { conversationId, content } = req.body;
-    const [conv] = query('SELECT * FROM conversations WHERE id = ? AND userId = ?', [conversationId, req.userId]);
-    if (!conv[0]) return res.status(404).json({ error: 'Not found' });
+    const convs = await dbQuery('conversations', 'find', { filter: `id.eq.${conversationId}` });
+    if (!convs || convs.length === 0 || convs[0].user_id !== req.userId) return res.status(404).json({ error: 'Conversation not found' });
 
-    query('INSERT INTO messages (conversationId, role, content, createdAt) VALUES (?, ?, ?, NOW())', [conversationId, 'user', content]);
-    const [history] = query('SELECT role, content FROM messages WHERE conversationId = ? ORDER BY createdAt', [conversationId]);
+    await dbQuery('messages', 'create', { method: 'POST', body: { conversation_id: conversationId, role: 'user', content } });
+    const history = await dbQuery('messages', 'find', { filter: `conversation_id.eq.${conversationId}` });
     const aiContent = await generateAIResponse(content, history, conversationId);
-    const [result] = query('INSERT INTO messages (conversationId, role, content, createdAt) VALUES (?, ?, ?, NOW())', [conversationId, 'assistant', aiContent]);
-    query('UPDATE conversations SET updatedAt = NOW() WHERE id = ?', [conversationId]);
+    const result = await dbQuery('messages', 'create', { method: 'POST', body: { conversation_id: conversationId, role: 'assistant', content: aiContent } });
+    await dbQuery('conversations', 'update', { filter: `id.eq.${conversationId}`, method: 'PATCH', body: { updated_at: new Date().toISOString() } });
 
-    res.json({ messageId: result.insertId, content: aiContent, conversationId });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ messageId: result.id, content: aiContent, conversationId });
+  } catch (e) { res.status(500).json({ error: 'Failed to send message' }); }
 });
 
 module.exports = app;
