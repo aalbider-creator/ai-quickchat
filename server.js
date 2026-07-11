@@ -42,23 +42,47 @@ function query(sql, params) {
   return [[]];
 }
 
-function generateAIResponse(userMsg, history) {
+async function generateAIResponse(userMsg, history) {
   const lower = userMsg.toLowerCase().trim();
-  if (/^(hi|hello|hey)/.test(lower)) return "Hey there! I'm your AI assistant. What can I help you with today?";
-  if (/(who are you|what are you)/.test(lower)) return "I'm an AI assistant. This app uses a real Node.js backend with Express — not fake simulations.";
-  if (/(how.*work|technology|stack)/.test(lower)) return "Full-stack: HTML/CSS/JS frontend, Node.js + Express backend. Messages persist via REST API.";
-  if (/(code|javascript|react|node|python)/.test(lower)) {
-    if (lower.includes('javascript') || lower.includes('js')) return "JavaScript tips: closures, async/await, event loop. Use TypeScript to catch bugs early.";
-    if (lower.includes('react')) return "React: functional components + hooks, keep state local, useMemo for expensive calcs.";
-    if (lower.includes('python')) return "Python: great for data science. Check scikit-learn, TensorFlow, FastAPI for backends.";
-    return "I can help with JavaScript, TypeScript, React, Node.js, Python, SQL. What's your question?";
+  
+  // Inappropriate content filter
+  if (/(penis|sex|porn|nude|naked|kill|murder|terrorist|bomb|hack|crack|steal|illegal)/.test(lower)) {
+    return "I'm designed to help with coding, tech, and career questions. Let's keep it professional! Ask me about JavaScript, React, Node.js, Python, or web development.";
   }
-  if (/(database|sql|mysql)/.test(lower)) return "Every message persists — refresh and conversations are still there. Real backend power.";
-  if (/(career|job|learn|interview|portfolio)/.test(lower)) return "Build real projects. This chat app shows: database design, API architecture, frontend integration.";
-  if (/(thank|thanks)/.test(lower)) return "You're welcome! Happy to help.";
-  if (/(bye|goodbye)/.test(lower)) return "Goodbye! Your conversation is saved — come back anytime.";
-  const generics = ["Interesting! Tell me more.", "Good question. I can discuss coding, web dev, or career advice.", "Everything here goes through a real backend API.", "I'm designed for coding help and tech questions. What would you like to explore?", "This app shows: Node.js, Express, REST API design, CORS handling."];
-  return generics[lower.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % generics.length];
+  
+  // Coding help
+  if (/(javascript|js|react|node|python|html|css|sql|bug|error|debug|function|variable|loop|array|object|api|database)/.test(lower)) {
+    if (lower.includes('javascript') || lower.includes('js')) return "JavaScript powers the web! Start with variables (let/const), arrow functions, and async/await. The event loop is key to understanding how JS works. Want me to explain any of these?";
+    if (lower.includes('react')) return "React is all about components and hooks. useState manages state, useEffect handles side effects. JSX lets you write HTML inside JavaScript. What React concept are you struggling with?";
+    if (lower.includes('python')) return "Python reads like English — great for beginners! For data science: pandas + numpy. For web backends: FastAPI or Flask. For ML: scikit-learn + TensorFlow. What's your goal?";
+    if (lower.includes('node')) return "Node.js runs JavaScript on the server. Use Express to build APIs, npm for packages, and connect to databases like MySQL or MongoDB. This very chat app uses Node.js + Express!";
+    if (lower.includes('sql')) return "SQL is how you talk to databases. SELECT reads data, INSERT adds, UPDATE changes, DELETE removes. JOINs combine tables. Every web app needs database knowledge — practice writing real queries!";
+    if (lower.includes('bug') || lower.includes('error') || lower.includes('debug')) return "Debugging is a superpower! 1) Read the error message twice. 2) Use console.log() to trace values. 3) Comment out code to isolate the issue. 4) Google the exact error. What's your error message?";
+    if (lower.includes('api')) return "APIs let frontend and backend talk. REST APIs use GET (read), POST (create), PUT (update), DELETE (remove). This chat app uses a REST API to send messages to the server. Want to learn how to build one?";
+    return "Great coding question! I can help with JavaScript, React, Node.js, Python, SQL, HTML/CSS, and more. What's the specific problem you're working on?";
+  }
+  
+  // About the app
+  if (/(who are you|what are you|what is this)/.test(lower)) return "I'm an AI assistant in this chat app. The app is built with: HTML/CSS/JS frontend (on Namecheap), Node.js + Express backend (on Vercel), and this smart response engine. It's a real full-stack project!";
+  if (/(how.*work|tech stack|architecture|backend|frontend)/.test(lower)) return "Tech stack breakdown: Frontend = HTML/CSS/JS deployed on Namecheap. Backend = Node.js + Express on Vercel (serverless). API = REST with CORS. Storage = in-memory database. This is how real web apps are architected!";
+  
+  // Greetings
+  if (/^(hi|hello|hey|yo|sup|howdy)/.test(lower)) return "Hey there! 👋 I'm your AI coding assistant. Ask me about JavaScript, React, Node.js, Python, SQL, web development, or tech careers!";
+  
+  // Career/learning
+  if (/(career|job|interview|portfolio|hire|learn|study|degree)/.test(lower)) return "For tech careers: 1) Build projects like this chat app. 2) Deploy them with live links. 3) Put links on your resume. 4) Practice data structures on LeetCode. 5) Contribute to open source. This app alone proves full-stack skills!";
+  
+  // Thanks/goodbye
+  if (/(thank|thanks)/.test(lower)) return "You're welcome! Happy coding! 🚀 Keep building and deploying!";
+  if (/(bye|goodbye|see you|later)/.test(lower)) return "Goodbye! Your conversations are saved. Come back anytime and keep building cool stuff!";
+  
+  // Context-aware based on conversation length
+  const convLength = history.length;
+  if (convLength > 6) return "We've been chatting for a while! Based on our conversation, you're clearly interested in tech. What project are you building right now? I'd love to help.";
+  if (convLength > 3) return "Got it! I'm here to help with coding questions, explain tech concepts, or give career advice. What would you like to dive into?";
+  
+  // Default
+  return "I'm your AI assistant for this chat app! I can help with JavaScript, React, Node.js, Python, SQL, web development, and career advice. What would you like to talk about?";
 }
 
 // Routes
@@ -72,7 +96,6 @@ app.post('/api/rest/conversations/:userId', async (req, res) => { try { const [r
 
 app.delete('/api/rest/conversations/:userId/:id', async (req, res) => { try { query('DELETE FROM messages WHERE conversationId = ?', [req.params.id]); query('DELETE FROM conversations WHERE id = ?', [req.params.id]); res.json({ success: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
-app.post('/api/rest/messages/:userId', async (req, res) => { try { const { conversationId, content } = req.body; const [conv] = query('SELECT * FROM conversations WHERE id = ? AND userId = ?', [conversationId, req.params.userId]); if (!conv[0]) return res.status(404).json({ error: 'Not found' }); query('INSERT INTO messages (conversationId, role, content, createdAt) VALUES (?, ?, ?, NOW())', [conversationId, 'user', content]); const [history] = query('SELECT role, content FROM messages WHERE conversationId = ? ORDER BY createdAt', [conversationId]); const aiContent = generateAIResponse(content, history); const [result] = query('INSERT INTO messages (conversationId, role, content, createdAt) VALUES (?, ?, ?, NOW())', [conversationId, 'assistant', aiContent]); query('UPDATE conversations SET updatedAt = NOW() WHERE id = ?', [conversationId]); res.json({ messageId: result.insertId, content: aiContent, conversationId }); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.post('/api/rest/messages/:userId', async (req, res) => { try { const { conversationId, content } = req.body; const [conv] = query('SELECT * FROM conversations WHERE id = ? AND userId = ?', [conversationId, req.params.userId]); if (!conv[0]) return res.status(404).json({ error: 'Not found' }); query('INSERT INTO messages (conversationId, role, content, createdAt) VALUES (?, ?, ?, NOW())', [conversationId, 'user', content]); const [history] = query('SELECT role, content FROM messages WHERE conversationId = ? ORDER BY createdAt', [conversationId]); const aiContent = await generateAIResponse(content, history); const [result] = query('INSERT INTO messages (conversationId, role, content, createdAt) VALUES (?, ?, ?, NOW())', [conversationId, 'assistant', aiContent]); query('UPDATE conversations SET updatedAt = NOW() WHERE id = ?', [conversationId]); res.json({ messageId: result.insertId, content: aiContent, conversationId }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
-// For Vercel serverless - export the app
 module.exports = app;
