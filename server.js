@@ -11,9 +11,11 @@ const JWT_SECRET = process.env.JWT_SECRET || 'ahmad-dev-secret-key-2025';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const CODE_EXPIRY_MS = 60 * 1000; // 60 seconds
 
 const hasDB = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
+const hasOpenAI = !!OPENAI_API_KEY;
 
 // ===== IN-MEMORY FALLBACK (when no DB) =====
 const memStore = {
@@ -221,11 +223,61 @@ function detectTopic(msg) {
   return null;
 }
 
+// ===== OPENAI API =====
+async function callOpenAI(userMsg, history) {
+  if (!hasOpenAI) return null;
+  try {
+    const messages = [
+      { role: 'system', content: 'You are a helpful AI assistant for a web developer\'s portfolio chat app. Be concise, friendly, and knowledgeable about JavaScript, React, Node.js, Python, SQL, web development, and tech careers. Keep responses under 150 words.' }
+    ];
+    // Add last 10 messages for context
+    const recentHistory = history.slice(-10);
+    for (const m of recentHistory) {
+      messages.push({ role: m.role, content: m.content });
+    }
+    messages.push({ role: 'user', content: userMsg });
+
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-3.5-turbo',
+        messages: messages,
+        max_tokens: 300,
+        temperature: 0.7
+      })
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      console.error('OpenAI error:', err.substring(0, 200));
+      return null;
+    }
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    console.error('OpenAI fetch error:', e.message);
+    return null;
+  }
+}
+
 async function generateAIResponse(userMsg, history, conversationId) {
   const lower = userMsg.toLowerCase().trim();
+
+  // Safety filter
   if (/(penis|sex|porn|nude|naked|kill|murder|terrorist|bomb|steal|illegal drugs)/.test(lower)) {
     return "I'm designed to help with coding, tech, and career questions. Let's keep it professional!";
   }
+
+  // Try OpenAI first if configured
+  if (hasOpenAI) {
+    const openaiResponse = await callOpenAI(userMsg, history);
+    if (openaiResponse) return openaiResponse;
+  }
+
+  // Fallback: rule-based responses
   const detectedTopic = detectTopic(userMsg);
   if (detectedTopic) conversationTopics[conversationId] = detectedTopic;
   const topic = conversationTopics[conversationId];
@@ -516,7 +568,7 @@ app.get('/api/rest/health', async (req, res) => {
       dbStatus = 'connected';
     } catch (e) { dbStatus = 'error: ' + e.message; }
   }
-  res.json({ ok: true, auth: true, db: hasDB, dbStatus, envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY } });
+  res.json({ ok: true, auth: true, db: hasDB, dbStatus, openai: hasOpenAI, envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY } });
 });
 
 app.get('/api/rest/conversations', authMiddleware, async (req, res) => {
