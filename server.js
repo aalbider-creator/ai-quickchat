@@ -13,7 +13,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY || '';
-const CODE_EXPIRY_MS = 60 * 1000; // 60 seconds
+const CODE_EXPIRY_MS = 60 * 1000; // 60 seconds for verification code
+const PASSWORD_TOKEN_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes for password creation
 
 const hasDB = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
 const hasOpenAI = !!OPENAI_API_KEY;
@@ -460,7 +461,7 @@ app.post('/api/rest/auth/verify-code', async (req, res) => {
     // Check if user already exists
     let users;
     try { users = await dbQuery('users', 'find', { filter: { email: 'eq.' + decoded.email } }); } catch { users = []; }
-    const passwordToken = jwtEncode({ email: decoded.email, verified: true, exp: Date.now() + CODE_EXPIRY_MS });
+    const passwordToken = jwtEncode({ email: decoded.email, verified: true, exp: Date.now() + PASSWORD_TOKEN_EXPIRY_MS });
     res.json({ message: 'Code verified!', passwordToken, hasAccount: users.length > 0 });
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
