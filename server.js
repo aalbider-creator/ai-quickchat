@@ -289,10 +289,13 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
 
 // Extract city name from message (e.g., "weather in Phoenix" -> "Phoenix")
 function extractCity(msg) {
-  const match = msg.match(/(?:weather|temperature).*\bin\s+([a-zA-Z\s]+?)(?:\?|$)/i) ||
-                msg.match(/(?:weather|temperature).*\bfor\s+([a-zA-Z\s]+?)(?:\?|$)/i) ||
-                msg.match(/([a-zA-Z\s]+?)\s+(?:weather|temperature)/i);
-  return match ? match[1].trim() : null;
+  // Pattern 1: "weather in [city]" or "temperature in [city]"
+  let m = msg.match(/(?:weather|temperature)\s+(?:in|for|at)\s+([a-zA-Z][a-zA-Z\s]{1,30}?)(?:\?|\.|$|\s+(?:today|now|tomorrow|like))/i);
+  if (m) { const city = m[1].trim(); if (city.length >= 2) return city; }
+  // Pattern 2: "what's the weather in [city]"
+  m = msg.match(/\bin\s+([a-zA-Z][a-zA-Z\s]{1,30}?)(?:\?|\.|$|\s+(?:today|now|tomorrow))/i);
+  if (m) { const city = m[1].trim(); if (city.length >= 2) return city; }
+  return null;
 }
 
 async function getCityFromIP(ip) {
@@ -340,27 +343,28 @@ async function generateAIResponse(userMsg, history, conversationId, clientIp) {
 
   // Check for weather questions with IP-based location + manual city fallback
   if (isWeatherQuestion(userMsg)) {
-    // Try IP detection first
-    const location = await getCityFromIP(clientIp);
-    if (location && location.city) {
-      const weather = await getWeather(location.lat, location.lon, location.city);
-      if (weather) {
-        return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
-      }
+    if (!OPENWEATHER_API_KEY) {
+      return "Weather service is not configured yet. Ask Ahmad to add an OpenWeather API key!";
     }
-    // Try manual city from message (e.g., "weather in Phoenix")
+    // Try manual city from message first (most reliable)
     const manualCity = extractCity(userMsg);
     if (manualCity) {
       const weather = await getWeather(null, null, manualCity);
       if (weather) {
         return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
       }
-      return `I couldn't find weather data for "${manualCity}". Try a different city name!`;
+      return `I couldn't find weather data for "${manualCity}". Try a different city name, or check your spelling.`;
     }
+    // Try IP-based location detection
+    const location = await getCityFromIP(clientIp);
     if (location && location.city) {
-      return `I detected you're in ${location.city}, but the weather service isn't responding. Try asking "What's the weather in ${location.city}?"`;
+      const weather = await getWeather(location.lat, location.lon, location.city);
+      if (weather) {
+        return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}, ${location.region}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
+      }
+      return `I detected you're in ${location.city}, but the weather service isn't responding. The API key may still be activating (can take up to 2 hours). Try again later!`;
     }
-    return "I can check the weather! Try: \"What's the weather in [city]?\"";
+    return "I can check the weather! Just ask: \"What's the weather in [city name]?\"";
   }
 
   // Try Groq/OpenAI first if configured
@@ -409,7 +413,13 @@ async function generateAIResponse(userMsg, history, conversationId, clientIp) {
 
 // Helper: get client IP
 function getClientIp(req) {
-  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+  // Vercel sends client IP in x-forwarded-for (first IP in chain)
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    const ips = forwarded.split(',').map(s => s.trim()).filter(s => s && !s.startsWith('10.') && !s.startsWith('192.168.') && !s.startsWith('127.'));
+    if (ips.length > 0) return ips[0];
+  }
+  return req.socket?.remoteAddress || req.ip || 'unknown';
 }
 
 // Step 1: Send verification code
@@ -682,7 +692,7 @@ app.get('/api/rest/health', async (req, res) => {
     } catch (e) { dbStatus = 'error: ' + e.message; }
   }
   const groqKey = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY;
-  res.json({ ok: true, auth: true, db: hasDB, dbStatus, ai: !!groqKey, aiType: groqKey ? 'groq' : 'none', envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY, ai_key: !!groqKey } });
+  res.json({ ok: true, auth: true, db: hasDB, dbStatus, ai: !!groqKey, aiType: groqKey ? 'groq' : 'none', weather: !!process.env.OPENWEATHER_API_KEY, envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY, ai_key: !!groqKey, weather_key: !!process.env.OPENWEATHER_API_KEY } });
 });
 
 app.get('/api/rest/test-ai', async (req, res) => {
