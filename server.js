@@ -628,6 +628,8 @@ app.post('/api/rest/messages', authMiddleware, async (req, res) => {
     await dbQuery('messages', 'create', { method: 'POST', body: { conversation_id: conversationId, role: 'user', content } });
     const history = await dbQuery('messages', 'find', { filter: { conversation_id: 'eq.' + conversationId } });
     const aiContent = await generateAIResponse(content, history, conversationId);
+    // Small delay ensures AI message has later timestamp than user message
+    await new Promise(r => setTimeout(r, 50));
     const result = await dbQuery('messages', 'create', { method: 'POST', body: { conversation_id: conversationId, role: 'assistant', content: aiContent } });
     await dbQuery('conversations', 'update', { filter: { id: 'eq.' + conversationId }, method: 'PATCH', body: { updated_at: new Date().toISOString() } });
 
