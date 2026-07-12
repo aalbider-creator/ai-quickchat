@@ -223,28 +223,28 @@ function detectTopic(msg) {
   return null;
 }
 
-// ===== OPENAI API =====
-async function callOpenAI(userMsg, history) {
-  if (!process.env.OPENAI_API_KEY) return null;
+// ===== GROQ API (free, fast AI) =====
+async function callGroq(userMsg, history) {
+  const GROQ_KEY = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY;
+  if (!GROQ_KEY) return null;
   try {
     const messages = [
       { role: 'system', content: 'You are a helpful AI assistant for a web developer\'s portfolio chat app. Be concise, friendly, and knowledgeable about JavaScript, React, Node.js, Python, SQL, web development, and tech careers. Keep responses under 150 words.' }
     ];
-    // Add last 10 messages for context
     const recentHistory = history.slice(-10);
     for (const m of recentHistory) {
       messages.push({ role: m.role, content: m.content });
     }
     messages.push({ role: 'user', content: userMsg });
 
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Authorization': `Bearer ${GROQ_KEY}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gpt-3.5-turbo',
+        model: 'llama-3.3-70b-versatile',
         messages: messages,
         max_tokens: 300,
         temperature: 0.7
@@ -252,13 +252,13 @@ async function callOpenAI(userMsg, history) {
     });
     if (!res.ok) {
       const err = await res.text();
-      console.error('OpenAI error:', err.substring(0, 200));
+      console.error('Groq error:', err.substring(0, 300));
       return null;
     }
     const data = await res.json();
     return data.choices?.[0]?.message?.content || null;
   } catch (e) {
-    console.error('OpenAI fetch error:', e.message);
+    console.error('Groq fetch error:', e.message);
     return null;
   }
 }
@@ -272,9 +272,9 @@ async function generateAIResponse(userMsg, history, conversationId) {
   }
 
   // Try OpenAI first if configured
-  if (process.env.OPENAI_API_KEY) {
-    const openaiResponse = await callOpenAI(userMsg, history);
-    if (openaiResponse) return openaiResponse;
+  if (process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY) {
+    const groqResponse = await callGroq(userMsg, history);
+    if (groqResponse) return groqResponse;
   }
 
   // Fallback: rule-based responses
@@ -568,16 +568,18 @@ app.get('/api/rest/health', async (req, res) => {
       dbStatus = 'connected';
     } catch (e) { dbStatus = 'error: ' + e.message; }
   }
-  res.json({ ok: true, auth: true, db: hasDB, dbStatus, openai: !!process.env.OPENAI_API_KEY, envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY, openai_key: !!process.env.OPENAI_API_KEY } });
+  const groqKey = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY;
+  res.json({ ok: true, auth: true, db: hasDB, dbStatus, ai: !!groqKey, aiType: groqKey ? 'groq' : 'none', envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY, ai_key: !!groqKey } });
 });
 
-app.get('/api/rest/test-openai', async (req, res) => {
-  if (!process.env.OPENAI_API_KEY) return res.json({ error: 'No OPENAI_API_KEY set' });
+app.get('/api/rest/test-ai', async (req, res) => {
+  const key = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY;
+  if (!key) return res.json({ error: 'No GROQ_API_KEY or OPENAI_API_KEY set' });
   try {
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-3.5-turbo', messages: [{role:'user',content:'Say "OpenAI is working!"'}], max_tokens: 20 })
+      headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{role:'user',content:'Say "Groq AI is working!"'}], max_tokens: 20 })
     });
     const data = await r.json();
     res.json({ status: r.status, ok: r.ok, response: data });
