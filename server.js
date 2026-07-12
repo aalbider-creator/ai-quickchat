@@ -229,7 +229,7 @@ async function callGroq(userMsg, history) {
   if (!GROQ_KEY) return null;
   try {
     const messages = [
-      { role: 'system', content: 'You are a helpful AI assistant for a web developer\'s portfolio chat app. Be concise, friendly, and knowledgeable about JavaScript, React, Node.js, Python, SQL, web development, and tech careers. Keep responses under 150 words.' }
+      { role: 'system', content: 'You are a friendly, helpful AI assistant. Be conversational, engaging, and knowledgeable on any topic. Keep responses concise and under 150 words. Do not focus on coding unless asked.' }
     ];
     const recentHistory = history.slice(-10);
     for (const m of recentHistory) {
@@ -307,8 +307,8 @@ async function generateAIResponse(userMsg, history, conversationId) {
   if (/(thank|thanks)/.test(lower)) return "You're welcome! Happy coding!";
   if (/(bye|goodbye)/.test(lower)) return "Goodbye! Your conversations are saved. Come back anytime!";
   const convLength = history.length;
-  if (convLength > 6) return "We've been chatting for a while! What project are you building? I can help with specific problems.";
-  return "I'm your AI assistant! I can help with JavaScript, React, Node.js, Python, SQL, web development, and career advice. What would you like to talk about?";
+  if (convLength > 6) return "We've been chatting for a while! What else would you like to talk about?";
+  return "Hey there! I'm your AI assistant — happy to chat about anything on your mind. What would you like to talk about?";
 }
 
 // ==========================================
@@ -599,7 +599,7 @@ app.get('/api/rest/conversations/:id', authMiddleware, async (req, res) => {
   try {
     const convs = await dbQuery('conversations', 'find', { filter: { id: 'eq.' + req.params.id } });
     if (!convs || convs.length === 0 || convs[0].user_id !== req.userId) return res.status(404).json({ error: 'Not found' });
-    const msgs = await dbQuery('messages', 'find', { filter: { conversation_id: 'eq.' + req.params.id } });
+    const msgs = await dbQuery('messages', 'find', { filter: { conversation_id: 'eq.' + req.params.id }, order: 'created_at.asc' });
     res.json({ ...convs[0], messages: msgs });
   } catch (e) { res.status(500).json({ error: 'Failed to load conversation' }); }
 });
