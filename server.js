@@ -271,14 +271,34 @@ function isWeatherQuestion(msg) {
          /(today|now|outside|like|is it|will it|going to)/.test(lower);
 }
 
+// Fetch with timeout (prevents hanging in serverless)
+async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return res;
+  } catch (e) {
+    clearTimeout(timer);
+    return null;
+  }
+}
+
+// Extract city name from message (e.g., "weather in Phoenix" -> "Phoenix")
+function extractCity(msg) {
+  const match = msg.match(/(?:weather|temperature).*\bin\s+([a-zA-Z\s]+?)(?:\?|$)/i) ||
+                msg.match(/(?:weather|temperature).*\bfor\s+([a-zA-Z\s]+?)(?:\?|$)/i) ||
+                msg.match(/([a-zA-Z\s]+?)\s+(?:weather|temperature)/i);
+  return match ? match[1].trim() : null;
+}
+
 async function getCityFromIP(ip) {
   try {
-    // Clean IP (remove port if present)
     const cleanIp = ip.split(':')[0].trim();
-    // Skip private IPs (localhost, etc.)
     if (cleanIp === '127.0.0.1' || cleanIp === '::1' || cleanIp.startsWith('192.168.') || cleanIp.startsWith('10.')) return null;
-    const res = await fetch(`https://ipapi.co/${cleanIp}/json/`);
-    if (!res.ok) return null;
+    const res = await fetchWithTimeout(`https://ipapi.co/${cleanIp}/json/`, {}, 4000);
+    if (!res) return null;
     const data = await res.json();
     if (data.error) return null;
     return { city: data.city, region: data.region, country: data.country_name, lat: data.latitude, lon: data.longitude };
@@ -295,8 +315,8 @@ async function getWeather(lat, lon, cityName) {
     } else {
       return null;
     }
-    const res = await fetch(url);
-    if (!res.ok) return null;
+    const res = await fetchWithTimeout(url, {}, 5000);
+    if (!res) return null;
     const data = await res.json();
     if (data.cod !== 200) return null;
     const tempC = Math.round(data.main.temp);
@@ -316,17 +336,29 @@ async function generateAIResponse(userMsg, history, conversationId, clientIp) {
     return "I'm designed to help with coding, tech, and career questions. Let's keep it professional!";
   }
 
-  // Check for weather questions with IP-based location
+  // Check for weather questions with IP-based location + manual city fallback
   if (isWeatherQuestion(userMsg)) {
+    // Try IP detection first
     const location = await getCityFromIP(clientIp);
     if (location && location.city) {
       const weather = await getWeather(location.lat, location.lon, location.city);
       if (weather) {
-        return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}, ${location.region}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
+        return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
       }
-      return `I detected you're in ${location.city}, ${location.region}. I need a weather API key to check the weather there. Ask Ahmad to add one!`;
     }
-    return "I can check the weather if you tell me your city — or ask your host to add a weather API key for auto-detect!";
+    // Try manual city from message (e.g., "weather in Phoenix")
+    const manualCity = extractCity(userMsg);
+    if (manualCity) {
+      const weather = await getWeather(null, null, manualCity);
+      if (weather) {
+        return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
+      }
+      return `I couldn't find weather data for "${manualCity}". Try a different city name!`;
+    }
+    if (location && location.city) {
+      return `I detected you're in ${location.city}, but the weather service isn't responding. Try asking "What's the weather in ${location.city}?"`;
+    }
+    return "I can check the weather! Try: \"What's the weather in [city]?\"";
   }
 
   // Try Groq/OpenAI first if configured
