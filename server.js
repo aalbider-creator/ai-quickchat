@@ -12,18 +12,18 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const CODE_EXPIRY_MS = 60 * 1000;
+const CODE_EXPIRY_MS = 60 * 1000; // 60 seconds
 
 const hasDB = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
 const hasOpenAI = !!OPENAI_API_KEY;
 
-// ===== IN-MEMORY FALLBACK =====
+// ===== IN-MEMORY FALLBACK (when no DB) =====
 const memStore = {
-  users: [], conversations: [], messages: [], passwordResets: [],
+  users: [], conversations: [], messages: [],
   nextUserId: 1, nextConvId: 1, nextMsgId: 1
 };
 const conversationTopics = {};
-const rateLimitMap = new Map();
+const rateLimitMap = new Map(); // IP -> { count, resetAt }
 
 // ===== JWT HELPERS =====
 function jwtEncode(payload) {
@@ -62,7 +62,10 @@ function checkRateLimit(ip, maxAttempts = 5, windowMs = 60 * 1000) {
   return { allowed: true };
 }
 
-// ===== SUPABASE REST API =====
+// ===== SUPABASE REST API HELPER =====
+// Filter format: { column: 'value' } or { column: 'operator.value' }
+// Examples: { email: 'test@test.com' } -> email=eq.test@test.com
+//           { id: 'eq.0' } -> id=eq.0
 async function dbQuery(table, action, options = {}) {
   if (!hasDB) return dbQueryMem(table, action, options);
   const { filter, body, method = 'GET', order, select = '*' } = options;
@@ -86,8 +89,9 @@ async function dbQuery(table, action, options = {}) {
   const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
   if (!res.ok) {
     const err = await res.text();
-    console.error('Supabase error:', err.substring(0, 200));
-    throw new Error('DB error: ' + res.status);
+    console.error('Supabase error URL:', url);
+    console.error('Supabase error response:', err.substring(0, 500));
+    throw new Error('DB error: URL=' + SUPABASE_URL.substring(0, 30) + '... Status=' + res.status);
   }
   const data = await res.json();
   return method === 'POST' && data[0] ? data[0] : data;
@@ -156,14 +160,16 @@ async function dbQueryMem(table, action, options) {
   }
   if (table === 'password_resets') {
     if (method === 'POST') {
+      memStore.passwordResets = memStore.passwordResets || [];
       memStore.passwordResets.push({ ...body, created_at: new Date().toISOString() });
       return body;
     }
     if (filter) {
+      memStore.passwordResets = memStore.passwordResets || [];
       const email = filter.split('eq.')[1];
       return memStore.passwordResets.filter(r => r.email === email);
     }
-    return memStore.passwordResets;
+    return memStore.passwordResets || [];
   }
   return [];
 }
@@ -197,19 +203,34 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized. Please log in.' });
   }
   const decoded = jwtDecode(authHeader.substring(7));
-  if (!decoded || !decoded.userId) return res.status(401).json({ error: 'Invalid or expired session.' });
+  if (!decoded || !decoded.userId) return res.status(401).json({ error: 'Invalid or expired session. Please log in again.' });
   req.userId = decoded.userId;
   req.email = decoded.email;
   next();
 }
 
+// ===== AI RESPONSE ENGINE =====
+function detectTopic(msg) {
+  const lower = msg.toLowerCase();
+  if (/(javascript|js|es6|typescript|ts|node|npm|webpack|babel)/.test(lower)) return 'javascript';
+  if (/(react|jsx|hooks|usestate|useeffect|redux|next\.?js)/.test(lower)) return 'react';
+  if (/(python|pandas|numpy|flask|fastapi|django|pip)/.test(lower)) return 'python';
+  if (/(sql|mysql|postgres|database|query|select|insert)/.test(lower)) return 'sql';
+  if (/(html|css|tailwind|bootstrap|flexbox|grid)/.test(lower)) return 'frontend';
+  if (/(api|rest|express|server|endpoint|route|middleware)/.test(lower)) return 'backend';
+  if (/(git|github|deploy|vercel|hosting|docker)/.test(lower)) return 'devops';
+  if (/(career|job|interview|resume|portfolio|hire)/.test(lower)) return 'career';
+  return null;
+}
+
 // ===== OPENAI API =====
 async function callOpenAI(userMsg, history) {
-  if (!hasOpenAI) return null;
+  if (!process.env.OPENAI_API_KEY) return null;
   try {
     const messages = [
       { role: 'system', content: 'You are a helpful AI assistant for a web developer\'s portfolio chat app. Be concise, friendly, and knowledgeable about JavaScript, React, Node.js, Python, SQL, web development, and tech careers. Keep responses under 150 words.' }
     ];
+    // Add last 10 messages for context
     const recentHistory = history.slice(-10);
     for (const m of recentHistory) {
       messages.push({ role: m.role, content: m.content });
@@ -242,42 +263,30 @@ async function callOpenAI(userMsg, history) {
   }
 }
 
-// ===== AI RESPONSE ENGINE =====
-function detectTopic(msg) {
-  const lower = msg.toLowerCase();
-  if (/(javascript|js|es6|typescript|ts|node|npm|webpack|babel)/.test(lower)) return 'javascript';
-  if (/(react|jsx|hooks|usestate|useeffect|redux|next\.?js)/.test(lower)) return 'react';
-  if (/(python|pandas|numpy|flask|fastapi|django|pip)/.test(lower)) return 'python';
-  if (/(sql|mysql|postgres|database|query|select|insert)/.test(lower)) return 'sql';
-  if (/(html|css|tailwind|bootstrap|flexbox|grid)/.test(lower)) return 'frontend';
-  if (/(api|rest|express|server|endpoint|route|middleware)/.test(lower)) return 'backend';
-  if (/(git|github|deploy|vercel|hosting|docker)/.test(lower)) return 'devops';
-  if (/(career|job|interview|resume|portfolio|hire)/.test(lower)) return 'career';
-  return null;
-}
-
 async function generateAIResponse(userMsg, history, conversationId) {
   const lower = userMsg.toLowerCase().trim();
 
+  // Safety filter
   if (/(penis|sex|porn|nude|naked|kill|murder|terrorist|bomb|steal|illegal drugs)/.test(lower)) {
     return "I'm designed to help with coding, tech, and career questions. Let's keep it professional!";
   }
 
-  if (hasOpenAI) {
+  // Try OpenAI first if configured
+  if (process.env.OPENAI_API_KEY) {
     const openaiResponse = await callOpenAI(userMsg, history);
     if (openaiResponse) return openaiResponse;
   }
 
+  // Fallback: rule-based responses
   const detectedTopic = detectTopic(userMsg);
   if (detectedTopic) conversationTopics[conversationId] = detectedTopic;
   const topic = conversationTopics[conversationId];
   const recentUserMsgs = history.filter(m => m.role === 'user').slice(-3).map(m => m.content.toLowerCase());
-
   if (topic === 'javascript' || recentUserMsgs.some(m => /(javascript|js)/.test(m))) {
     if (/(arrow function|=>)/.test(lower)) return "Arrow functions: `const add = (a, b) => a + b;`\n\n- Shorter syntax, no own 'this', great for callbacks.";
     if (/(async|await|promise)/.test(lower)) return "Async/await handles async code cleanly. `async` makes a function return a Promise, `await` pauses until it resolves.";
     if (/(let|const|var)/.test(lower)) return "`const` = block-scoped, can't reassign (use by default). `let` = block-scoped, can reassign. `var` = function-scoped (AVOID).";
-    return "JavaScript powers the web. Ask about variables, functions, async/await, or the DOM!";
+    return "JavaScript powers the web — runs in browsers and servers (via Node.js). Ask about variables, functions, async/await, or the DOM!";
   }
   if (topic === 'react' || recentUserMsgs.some(m => /(react|jsx|hooks)/.test(m))) {
     if (/(usestate|state)/.test(lower)) return "`useState` adds state to functional components. Returns [value, setter]. State changes trigger re-renders.";
@@ -302,13 +311,16 @@ async function generateAIResponse(userMsg, history, conversationId) {
   return "I'm your AI assistant! I can help with JavaScript, React, Node.js, Python, SQL, web development, and career advice. What would you like to talk about?";
 }
 
-// ===== HELPER =====
+// ==========================================
+// AUTH ROUTES
+// ==========================================
+
+// Helper: get client IP
 function getClientIp(req) {
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
 }
 
-// ===== AUTH ROUTES =====
-
+// Step 1: Send verification code
 app.post('/api/rest/auth/send-code', async (req, res) => {
   try {
     const { email } = req.body;
@@ -343,6 +355,7 @@ app.post('/api/rest/auth/send-code', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
+// Step 2: Verify code
 app.post('/api/rest/auth/verify-code', async (req, res) => {
   try {
     const { verifyToken, code } = req.body;
@@ -355,6 +368,7 @@ app.post('/api/rest/auth/verify-code', async (req, res) => {
     const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
     if (codeHash !== decoded.codeHash) return res.status(400).json({ error: 'Incorrect code. Please try again.' });
 
+    // Check if user already exists
     let users;
     try { users = await dbQuery('users', 'find', { filter: { email: 'eq.' + decoded.email } }); } catch { users = []; }
     const passwordToken = jwtEncode({ email: decoded.email, verified: true, exp: Date.now() + CODE_EXPIRY_MS });
@@ -362,11 +376,13 @@ app.post('/api/rest/auth/verify-code', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
+// Step 3: Set password (new account)
 app.post('/api/rest/auth/set-password', async (req, res) => {
   try {
     const { passwordToken, password } = req.body;
     if (!passwordToken || !password) return res.status(400).json({ error: 'Token and password are required' });
     if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    if (password.length > 128) return res.status(400).json({ error: 'Password too long' });
 
     const decoded = jwtDecode(passwordToken);
     if (!decoded || !decoded.verified) return res.status(400).json({ error: 'Invalid session. Please start over.' });
@@ -379,12 +395,15 @@ app.post('/api/rest/auth/set-password', async (req, res) => {
     try {
       const existing = await dbQuery('users', 'find', { filter: { email: 'eq.' + email } });
       if (existing.length > 0) {
+        // Update existing user's password
         await dbQuery('users', 'update', { filter: { email: 'eq.' + email }, method: 'PATCH', body: { password_hash: passwordHash } });
         user = { id: existing[0].id, email };
       } else {
+        // Create new user
         user = await dbQuery('users', 'create', { method: 'POST', body: { email, password_hash: passwordHash } });
       }
     } catch {
+      // Fallback: create in memory
       const existing = memStore.users.find(u => u.email === email);
       if (existing) {
         existing.password_hash = passwordHash;
@@ -401,6 +420,7 @@ app.post('/api/rest/auth/set-password', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
+// Login with email + password
 app.post('/api/rest/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -423,6 +443,7 @@ app.post('/api/rest/auth/login', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
+// Forgot password: send reset code
 app.post('/api/rest/auth/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
@@ -455,6 +476,7 @@ app.post('/api/rest/auth/forgot-password', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
+// Reset password with code
 app.post('/api/rest/auth/reset-password', async (req, res) => {
   try {
     const { resetToken, code, password } = req.body;
@@ -480,6 +502,7 @@ app.post('/api/rest/auth/reset-password', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
+// Change password (logged in)
 app.post('/api/rest/auth/change-password', authMiddleware, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
@@ -504,8 +527,10 @@ app.post('/api/rest/auth/change-password', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
+// Delete account
 app.delete('/api/rest/auth/account', authMiddleware, async (req, res) => {
   try {
+    // Delete user's conversations and messages
     try {
       const convs = await dbQuery('conversations', 'find', { filter: { user_id: 'eq.' + req.userId } });
       for (const c of convs) {
@@ -525,12 +550,16 @@ app.delete('/api/rest/auth/account', authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
+// Get current user
 app.get('/api/rest/auth/me', authMiddleware, async (req, res) => {
   res.json({ id: req.userId, email: req.email });
 });
 
-// ===== CHAT ROUTES =====
+// ==========================================
+// CHAT ROUTES
+// ==========================================
 
+// Health check - shows DB connection status
 app.get('/api/rest/health', async (req, res) => {
   let dbStatus = 'disabled';
   if (hasDB) {
@@ -539,7 +568,7 @@ app.get('/api/rest/health', async (req, res) => {
       dbStatus = 'connected';
     } catch (e) { dbStatus = 'error: ' + e.message; }
   }
-  res.json({ ok: true, auth: true, db: hasDB, dbStatus, openai: hasOpenAI, envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY } });
+  res.json({ ok: true, auth: true, db: hasDB, dbStatus, openai: !!process.env.OPENAI_API_KEY, envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY, openai_key: !!process.env.OPENAI_API_KEY } });
 });
 
 app.get('/api/rest/conversations', authMiddleware, async (req, res) => {
