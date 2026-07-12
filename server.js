@@ -438,7 +438,7 @@ app.post('/api/rest/auth/send-code', async (req, res) => {
     );
 
     if (result.error) {
-      return res.json({ message: 'Code ready!', verifyToken, testCode: code, emailFailed: true });
+      return res.json({ message: 'Email error: ' + result.error, verifyToken, testCode: code, emailFailed: true });
     }
     res.json({ message: 'Code sent! Check your email.', verifyToken });
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
@@ -558,7 +558,7 @@ app.post('/api/rest/auth/forgot-password', async (req, res) => {
     );
 
     if (result.error) {
-      return res.json({ message: 'Code ready!', resetToken, testCode: code, emailFailed: true });
+      return res.json({ message: 'Email error: ' + result.error, resetToken, testCode: code, emailFailed: true });
     }
     res.json({ message: 'Reset code sent! Check your email.', resetToken });
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
