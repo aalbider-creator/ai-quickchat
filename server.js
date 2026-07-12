@@ -12,6 +12,7 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY || '';
 const CODE_EXPIRY_MS = 60 * 1000; // 60 seconds
 
 const hasDB = !!(SUPABASE_URL && SUPABASE_ANON_KEY);
@@ -229,7 +230,7 @@ async function callGroq(userMsg, history) {
   if (!GROQ_KEY) return null;
   try {
     const messages = [
-      { role: 'system', content: 'You are a friendly, helpful AI assistant. Be conversational, engaging, and knowledgeable on any topic. Keep responses concise and under 150 words. Do not focus on coding unless asked.' }
+      { role: 'system', content: 'You are a knowledgeable, friendly conversationalist. Answer questions directly and helpfully. Keep responses concise (under 150 words) and engaging. Never mention that you are an AI, language model, or assistant. Never say you cannot do something — just give the best answer you can. Do not mention checking other apps, websites, or services unless specifically asked.' }
     ];
     const recentHistory = history.slice(-10);
     for (const m of recentHistory) {
@@ -263,7 +264,51 @@ async function callGroq(userMsg, history) {
   }
 }
 
-async function generateAIResponse(userMsg, history, conversationId) {
+// ===== WEATHER DETECTION =====
+function isWeatherQuestion(msg) {
+  const lower = msg.toLowerCase();
+  return /(weather|temperature|hot|cold|raining|sunny|forecast|celsius|fahrenheit|degrees?)/.test(lower) &&
+         /(today|now|outside|like|is it|will it|going to)/.test(lower);
+}
+
+async function getCityFromIP(ip) {
+  try {
+    // Clean IP (remove port if present)
+    const cleanIp = ip.split(':')[0].trim();
+    // Skip private IPs (localhost, etc.)
+    if (cleanIp === '127.0.0.1' || cleanIp === '::1' || cleanIp.startsWith('192.168.') || cleanIp.startsWith('10.')) return null;
+    const res = await fetch(`https://ipapi.co/${cleanIp}/json/`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.error) return null;
+    return { city: data.city, region: data.region, country: data.country_name, lat: data.latitude, lon: data.longitude };
+  } catch (e) { return null; }
+}
+
+async function getWeather(lat, lon, cityName) {
+  try {
+    let url;
+    if (OPENWEATHER_API_KEY && lat && lon) {
+      url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+    } else if (OPENWEATHER_API_KEY && cityName) {
+      url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(cityName)}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+    } else {
+      return null;
+    }
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.cod !== 200) return null;
+    const tempC = Math.round(data.main.temp);
+    const tempF = Math.round((data.main.temp * 9/5) + 32);
+    const feelsLikeC = Math.round(data.main.feels_like);
+    const desc = data.weather[0].description;
+    const humidity = data.main.humidity;
+    return { tempC, tempF, feelsLikeC, desc, humidity, city: data.name };
+  } catch (e) { return null; }
+}
+
+async function generateAIResponse(userMsg, history, conversationId, clientIp) {
   const lower = userMsg.toLowerCase().trim();
 
   // Safety filter
@@ -271,7 +316,20 @@ async function generateAIResponse(userMsg, history, conversationId) {
     return "I'm designed to help with coding, tech, and career questions. Let's keep it professional!";
   }
 
-  // Try OpenAI first if configured
+  // Check for weather questions with IP-based location
+  if (isWeatherQuestion(userMsg)) {
+    const location = await getCityFromIP(clientIp);
+    if (location && location.city) {
+      const weather = await getWeather(location.lat, location.lon, location.city);
+      if (weather) {
+        return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}, ${location.region}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
+      }
+      return `I detected you're in ${location.city}, ${location.region}. I need a weather API key to check the weather there. Ask Ahmad to add one!`;
+    }
+    return "I can check the weather if you tell me your city — or ask your host to add a weather API key for auto-detect!";
+  }
+
+  // Try Groq/OpenAI first if configured
   if (process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY) {
     const groqResponse = await callGroq(userMsg, history);
     if (groqResponse) return groqResponse;
@@ -625,7 +683,8 @@ app.post('/api/rest/messages', authMiddleware, async (req, res) => {
 
     await dbQuery('messages', 'create', { method: 'POST', body: { conversation_id: conversationId, role: 'user', content } });
     const history = await dbQuery('messages', 'find', { filter: { conversation_id: 'eq.' + conversationId } });
-    const aiContent = await generateAIResponse(content, history, conversationId);
+    const clientIp = getClientIp(req);
+    const aiContent = await generateAIResponse(content, history, conversationId, clientIp);
     // Small delay ensures AI message has later timestamp than user message
     await new Promise(r => setTimeout(r, 50));
     const result = await dbQuery('messages', 'create', { method: 'POST', body: { conversation_id: conversationId, role: 'assistant', content: aiContent } });
