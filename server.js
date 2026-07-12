@@ -695,6 +695,13 @@ app.get('/api/rest/health', async (req, res) => {
   res.json({ ok: true, auth: true, db: hasDB, dbStatus, ai: !!groqKey, aiType: groqKey ? 'groq' : 'none', weather: !!process.env.OPENWEATHER_API_KEY, envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY, ai_key: !!groqKey, weather_key: !!process.env.OPENWEATHER_API_KEY } });
 });
 
+app.get('/api/rest/test-weather', async (req, res) => {
+  const ip = getClientIp(req);
+  const location = await getCityFromIP(ip);
+  const weather = location ? await getWeather(location.lat, location.lon, location.city) : null;
+  res.json({ ip, location, weather, openweather_key_set: !!OPENWEATHER_API_KEY });
+});
+
 app.get('/api/rest/test-ai', async (req, res) => {
   const key = process.env.GROQ_API_KEY || process.env.OPENAI_API_KEY;
   if (!key) return res.json({ error: 'No GROQ_API_KEY or OPENAI_API_KEY set' });
