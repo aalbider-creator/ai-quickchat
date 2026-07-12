@@ -571,6 +571,21 @@ app.get('/api/rest/health', async (req, res) => {
   res.json({ ok: true, auth: true, db: hasDB, dbStatus, openai: !!process.env.OPENAI_API_KEY, envVars: { url: !!SUPABASE_URL, key: !!SUPABASE_ANON_KEY, openai_key: !!process.env.OPENAI_API_KEY } });
 });
 
+app.get('/api/rest/test-openai', async (req, res) => {
+  if (!process.env.OPENAI_API_KEY) return res.json({ error: 'No OPENAI_API_KEY set' });
+  try {
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-3.5-turbo', messages: [{role:'user',content:'Say "OpenAI is working!"'}], max_tokens: 20 })
+    });
+    const data = await r.json();
+    res.json({ status: r.status, ok: r.ok, response: data });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
 app.get('/api/rest/conversations', authMiddleware, async (req, res) => {
   try {
     const rows = await dbQuery('conversations', 'find', { filter: { user_id: 'eq.' + req.userId }, order: 'updated_at.desc' });
