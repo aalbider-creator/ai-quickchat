@@ -348,8 +348,8 @@ app.post('/api/rest/auth/send-code', async (req, res) => {
     );
 
     if (result.error) {
-      if (RESEND_API_KEY) return res.status(500).json({ error: result.error });
-      return res.json({ message: 'Test mode - check server logs', verifyToken, testCode: code });
+      // Email failed but still give user the code on screen
+      return res.json({ message: 'Email failed. Use this code:', verifyToken, testCode: code, emailFailed: true });
     }
     res.json({ message: 'Code sent! Check your email.', verifyToken });
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
@@ -469,8 +469,7 @@ app.post('/api/rest/auth/forgot-password', async (req, res) => {
     );
 
     if (result.error) {
-      if (RESEND_API_KEY) return res.status(500).json({ error: result.error });
-      return res.json({ message: 'Test mode', resetToken, testCode: code });
+      return res.json({ message: 'Email failed. Use this code:', resetToken, testCode: code, emailFailed: true });
     }
     res.json({ message: 'Reset code sent! Check your email.', resetToken });
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
