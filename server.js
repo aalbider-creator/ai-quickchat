@@ -3,7 +3,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 
 const app = express();
-app.use(cors({ origin: ['https://ahmadswork.com', 'https://www.ahmadswork.com'], credentials: true }));
+app.use(cors({ origin: ['https://ahmadswork.com', 'https://www.ahmadswork.com', 'http://ahmadswork.com', 'http://www.ahmadswork.com', null], credentials: true }));
 app.use(express.json());
 
 // ===== CONFIG =====
@@ -341,7 +341,7 @@ async function generateAIResponse(userMsg, history, conversationId, clientIp) {
     return "I'm designed to help with coding, tech, and career questions. Let's keep it professional!";
   }
 
-  // Check for weather questions with IP-based location + manual city fallback
+  // Check for weather questions
   if (isWeatherQuestion(userMsg)) {
     if (!OPENWEATHER_API_KEY) {
       return "Weather service is not configured yet. Ask Ahmad to add an OpenWeather API key!";
@@ -353,17 +353,19 @@ async function generateAIResponse(userMsg, history, conversationId, clientIp) {
       if (weather) {
         return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
       }
-      return `I couldn't find weather data for "${manualCity}". Try a different city name, or check your spelling.`;
+      return `I couldn't find weather data for "${manualCity}". Try a different city name.`;
     }
-    // Try IP-based location detection
-    const location = await getCityFromIP(clientIp);
-    if (location && location.city) {
-      const weather = await getWeather(location.lat, location.lon, location.city);
-      if (weather) {
-        return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}, ${location.region}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
+    // Try IP-based location (best effort, often blocked in serverless)
+    try {
+      const location = await getCityFromIP(clientIp);
+      if (location && location.city) {
+        const weather = await getWeather(location.lat, location.lon, location.city);
+        if (weather) {
+          return `It's ${weather.desc} and ${weather.tempC}°C (${weather.tempF}°F) in ${weather.city}, ${location.region}. Feels like ${weather.feelsLikeC}°C with ${weather.humidity}% humidity.`;
+        }
       }
-      return `I detected you're in ${location.city}, but the weather service isn't responding. The API key may still be activating (can take up to 2 hours). Try again later!`;
-    }
+    } catch (e) { /* IP detection failed, fall through */ }
+    // Fallback: ask for city
     return "I can check the weather! Just ask: \"What's the weather in [city name]?\"";
   }
 
