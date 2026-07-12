@@ -8,6 +8,7 @@ app.use(express.json());
 
 // ===== CONFIG =====
 const JWT_SECRET = process.env.JWT_SECRET || 'ahmad-dev-secret-key-2025';
+const PASSWORD_SALT = 'ahmad-portfolio-password-salt-v1'; // Dedicated salt for passwords - NEVER change this
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
@@ -45,7 +46,7 @@ function jwtDecode(token) {
 
 // ===== PASSWORD =====
 function hashPassword(password) {
-  return crypto.createHash('sha256').update(password + JWT_SECRET).digest('hex');
+  return crypto.createHash('sha256').update(password + PASSWORD_SALT).digest('hex');
 }
 
 // ===== RATE LIMITING =====
@@ -424,7 +425,7 @@ app.post('/api/rest/auth/send-code', async (req, res) => {
     if (!emailRegex.test(email)) return res.status(400).json({ error: 'Please enter a valid email address' });
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
+    const codeHash = crypto.createHash('sha256').update(code + PASSWORD_SALT).digest('hex');
     const verifyToken = jwtEncode({ email, codeHash, exp: Date.now() + CODE_EXPIRY_MS });
 
     const result = await sendEmail(email, 'Your Login Code - Ahmad\'s Portfolio',
@@ -455,7 +456,7 @@ app.post('/api/rest/auth/verify-code', async (req, res) => {
     if (!decoded) return res.status(400).json({ error: 'Invalid verification link. Please request a new code.' });
     if (Date.now() > decoded.exp) return res.status(400).json({ error: 'Code expired. Please request a new one.' });
 
-    const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
+    const codeHash = crypto.createHash('sha256').update(code + PASSWORD_SALT).digest('hex');
     if (codeHash !== decoded.codeHash) return res.status(400).json({ error: 'Incorrect code. Please try again.' });
 
     // Check if user already exists
@@ -544,8 +545,8 @@ app.post('/api/rest/auth/forgot-password', async (req, res) => {
     if (!users || users.length === 0) return res.status(404).json({ error: 'No account found with this email.' });
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
-    const resetToken = jwtEncode({ email, codeHash, exp: Date.now() + CODE_EXPIRY_MS });
+    const codeHash = crypto.createHash('sha256').update(code + PASSWORD_SALT).digest('hex');
+    const resetToken = jwtEncode({ email, codeHash, exp: Date.now() + PASSWORD_TOKEN_EXPIRY_MS });
 
     const result = await sendEmail(email, 'Password Reset - Ahmad\'s Portfolio',
       `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:40px auto;padding:32px;background:#0f0f11;color:#fafaf9;border-radius:8px;border:1px solid rgba(255,255,255,0.08)">
@@ -576,7 +577,7 @@ app.post('/api/rest/auth/reset-password', async (req, res) => {
     if (!decoded) return res.status(400).json({ error: 'Invalid token. Please request a new code.' });
     if (Date.now() > decoded.exp) return res.status(400).json({ error: 'Code expired. Please request a new one.' });
 
-    const codeHash = crypto.createHash('sha256').update(code + JWT_SECRET).digest('hex');
+    const codeHash = crypto.createHash('sha256').update(code + PASSWORD_SALT).digest('hex');
     if (codeHash !== decoded.codeHash) return res.status(400).json({ error: 'Incorrect code. Please try again.' });
 
     const passwordHash = hashPassword(password);
@@ -617,6 +618,29 @@ app.post('/api/rest/auth/change-password', authMiddleware, async (req, res) => {
 });
 
 // Delete account
+// Delete account by email (for stale account cleanup when user can't login)
+app.post('/api/rest/auth/delete-by-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    try {
+      const users = await dbQuery('users', 'find', { filter: { email: 'eq.' + email } });
+      if (users && users.length > 0) {
+        const userId = users[0].id;
+        await dbQuery('conversations', 'delete', { filter: { user_id: 'eq.' + userId }, method: 'DELETE' });
+        await dbQuery('users', 'delete', { filter: { id: 'eq.' + userId }, method: 'DELETE' });
+      }
+    } catch {
+      const user = memStore.users.find(u => u.email === email);
+      if (user) {
+        memStore.conversations = memStore.conversations.filter(c => c.user_id !== user.id);
+        memStore.users = memStore.users.filter(u => u.id !== user.id);
+      }
+    }
+    res.json({ message: 'Account deleted' });
+  } catch (e) { res.status(500).json({ error: 'Failed to delete account' }); }
+});
+
 app.delete('/api/rest/auth/account', authMiddleware, async (req, res) => {
   try {
     // Delete user's conversations and messages
