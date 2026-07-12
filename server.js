@@ -3,7 +3,7 @@ const cors = require('cors');
 const crypto = require('crypto');
 
 const app = express();
-app.use(cors({ origin: ['https://ahmadswork.com', 'https://www.ahmadswork.com', 'http://ahmadswork.com', 'http://www.ahmadswork.com', null], credentials: true }));
+app.use(cors({ origin: true }));
 app.use(express.json());
 
 // ===== CONFIG =====
