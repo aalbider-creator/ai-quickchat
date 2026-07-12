@@ -347,11 +347,8 @@ app.post('/api/rest/auth/send-code', async (req, res) => {
       </div>`
     );
 
-    if (result.error) {
-      // Email failed but still give user the code on screen
-      return res.json({ message: 'Email failed. Use this code:', verifyToken, testCode: code, emailFailed: true });
-    }
-    res.json({ message: 'Code sent! Check your email.', verifyToken });
+    // Always return code on screen for instant login (no email dependency)
+    res.json({ message: 'Code ready!', verifyToken, testCode: code });
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
@@ -468,10 +465,8 @@ app.post('/api/rest/auth/forgot-password', async (req, res) => {
       </div>`
     );
 
-    if (result.error) {
-      return res.json({ message: 'Email failed. Use this code:', resetToken, testCode: code, emailFailed: true });
-    }
-    res.json({ message: 'Reset code sent! Check your email.', resetToken });
+    // Always return code on screen for instant password reset
+    res.json({ message: 'Code ready!', resetToken, testCode: code });
   } catch (e) { res.status(500).json({ error: 'Something went wrong. Please try again.' }); }
 });
 
